@@ -393,7 +393,7 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"_{datetime.now().strftime('%d/%m/%Y %H:%M')}_\n\n"
             f"{ai_text}"
         )
-        await msg.edit_text(teks, parse_mode="Markdown")
+        await msg.edit_text(teks, parse_mode=None)
     except Exception as e:
         await msg.edit_text(f"❌ Gagal:\n`{e}`", parse_mode="Markdown")
 
