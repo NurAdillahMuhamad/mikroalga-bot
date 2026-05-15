@@ -260,7 +260,9 @@ def cek_alert(sensor_data: dict):
     alerts = []
     try:
         ph = float(sensor_data.get("pH", 0))
-        if ph < PH_MIN:
+        if ph == 0 or ph is None:
+            pass  # data kosong, skip
+        elif ph < PH_MIN:
             alerts.append(f"🔴 pH RENDAH: `{ph}` (batas bawah {PH_MIN})")
         elif ph > PH_MAX:
             alerts.append(f"🟡 pH TINGGI: `{ph}` (batas atas {PH_MAX})")
@@ -477,10 +479,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Content-Type" : "application/json"
         }
         body = {
-            "model"     : "llama3-8b-8192",
+            "model"     : "llama-3.1-8b-instant",  # ← ganti dari llama3-8b-8192
             "messages"  : [{"role": "user", "content": prompt}],
             "max_tokens": 300
-        }
+}
         r      = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             json=body, headers=headers, timeout=30
