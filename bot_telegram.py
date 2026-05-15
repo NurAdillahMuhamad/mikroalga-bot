@@ -271,7 +271,7 @@ def cek_alert(sensor_data: dict):
 
     try:
         lux = int(sensor_data.get("cahaya", 9999))
-        if lux < LUX_MIN and sensor_data.get("uv") != "ON":
+        if lux < LUX_MIN and lux != -1 and sensor_data.get("uv") != "ON":
             alerts.append(f"⚠️ CAHAYA KURANG: `{lux} Lux` (minimum {LUX_MIN})")
     except:
         pass
