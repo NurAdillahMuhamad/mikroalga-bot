@@ -250,16 +250,19 @@ def health():
 # =============================================
 
 def run_bot():
-    """Jalankan bot_telegram.py sebagai subprocess."""
-    print("[BOT] Memulai bot_telegram.py...")
+    """Jalankan bot_telegram.py sebagai subprocess, retry kalau crash."""
+    import time
     bot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_telegram.py")
-    process  = subprocess.Popen(
-        [sys.executable, bot_path],
-        stdout=sys.stdout,
-        stderr=sys.stderr
-    )
-    process.wait()
-    print("[BOT] bot_telegram.py berhenti!")
+    while True:
+        print("[BOT] Memulai bot_telegram.py...")
+        process = subprocess.Popen(
+            [sys.executable, bot_path],
+            stdout=sys.stdout,
+            stderr=sys.stderr
+        )
+        process.wait()
+        print("[BOT] bot_telegram.py berhenti! Restart dalam 15 detik...")
+        time.sleep(15)  # tunggu 15 detik sebelum restart — beri waktu instance lama mati
 
 
 if __name__ == "__main__":
