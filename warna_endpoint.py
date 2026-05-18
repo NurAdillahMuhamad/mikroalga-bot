@@ -249,9 +249,13 @@ def health():
 #  MAIN — jalankan Flask + Bot Telegram
 # =============================================
 
+# SESUDAH ✅
 def run_bot():
-    """Jalankan bot_telegram.py sebagai subprocess, retry kalau crash."""
     import time
+    # Tunggu 20 detik dulu — beri waktu instance Railway lama benar-benar mati
+    print("[BOT] Menunggu 20 detik sebelum start...")
+    time.sleep(20)
+    
     bot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_telegram.py")
     while True:
         print("[BOT] Memulai bot_telegram.py...")
@@ -261,9 +265,8 @@ def run_bot():
             stderr=sys.stderr
         )
         process.wait()
-        print("[BOT] bot_telegram.py berhenti! Restart dalam 15 detik...")
-        time.sleep(15)  # tunggu 15 detik sebelum restart — beri waktu instance lama mati
-
+        print("[BOT] bot_telegram.py berhenti! Restart dalam 30 detik...")
+        time.sleep(30)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
