@@ -644,4 +644,8 @@ if __name__ == "__main__":
     )
 
     print("Bot aktif.\n")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # SESUDAH ✅
+app.run_polling(
+    allowed_updates=Update.ALL_TYPES,
+    drop_pending_updates=True
+)
