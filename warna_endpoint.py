@@ -1,28 +1,18 @@
 """
-warna_endpoint.py
-=================
-Flask endpoint untuk Railway:
-  POST /upload_foto  ← terima JPEG dari ESP32-CAM
-  GET  /hasil_warna  ← baca hasil deteksi terakhir (untuk dashboard)
-  GET  /health       ← cek server hidup
-
-Cara deploy:
-1. Tambahkan file ini ke repo Railway kamu
-2. Di Procfile / railway.toml: jalankan kedua service sekaligus
-   (lihat catatan di bawah)
-
-Dependencies tambahan (tambahkan ke requirements.txt):
-  flask
-  numpy
-  opencv-python-headless   ← HEADLESS (tanpa GUI), cocok untuk server
-  pillow
+warna_endpoint.py - FINAL VERSION
+====================================
+Flask endpoint + Bot Telegram dalam satu process.
+- Flask terima foto dari ESP32-CAM (POST /upload_foto)
+- Bot Telegram jalan sebagai subprocess
+- Hasil deteksi disimpan ke hasil_warna.json
 """
 
 import os
 import io
 import json
-import time
 import threading
+import subprocess
+import sys
 import numpy as np
 import cv2
 from flask import Flask, request, jsonify
@@ -31,11 +21,11 @@ from datetime import datetime
 app = Flask(__name__)
 
 # =============================================
-#  STATE — simpan hasil deteksi terakhir
+#  STATE
 # =============================================
 
-_lock         = threading.Lock()
-_hasil_warna  = {
+_lock        = threading.Lock()
+_hasil_warna = {
     "warna"        : "tidak terdeteksi",
     "status_warna" : "-",
     "skor"         : 0.0,
@@ -46,43 +36,42 @@ _hasil_warna  = {
 
 # =============================================
 #  PROFIL HSV FALLBACK
-#  (kalau profil_hsv.json tidak ada, pakai ini)
 # =============================================
 
 PROFIL_FALLBACK = {
     "fase1": {
-        "label"  : "Fase 1: Pembibitan",
-        "lower"  : [25, 30, 80],
-        "upper"  : [45, 120, 200],
-        "hist_h" : [],
-        "hist_s" : [],
+        "label" : "Fase 1: Pembibitan",
+        "lower" : [25, 30, 80],
+        "upper" : [45, 120, 200],
+        "hist_h": [],
+        "hist_s": [],
     },
     "fase2": {
-        "label"  : "Fase 2: Pertumbuhan",
-        "lower"  : [40, 60, 60],
-        "upper"  : [75, 180, 180],
-        "hist_h" : [],
-        "hist_s" : [],
+        "label" : "Fase 2: Pertumbuhan",
+        "lower" : [40, 60, 60],
+        "upper" : [75, 180, 180],
+        "hist_h": [],
+        "hist_s": [],
     },
     "fase3": {
-        "label"  : "Fase 3: Optimal",
-        "lower"  : [75, 80, 40],
-        "upper"  : [100, 220, 160],
-        "hist_h" : [],
-        "hist_s" : [],
+        "label" : "Fase 3: Optimal",
+        "lower" : [75, 80, 40],
+        "upper" : [100, 220, 160],
+        "hist_h": [],
+        "hist_s": [],
     },
     "fase4": {
-        "label"  : "Fase 4: Panen",
-        "lower"  : [90, 100, 20],
-        "upper"  : [120, 255, 100],
-        "hist_h" : [],
-        "hist_s" : [],
+        "label" : "Fase 4: Panen",
+        "lower" : [90, 100, 20],
+        "upper" : [120, 255, 100],
+        "hist_h": [],
+        "hist_s": [],
     },
 }
 
-BOBOT_HSV  = 0.55
+BOBOT_HSV = 0.55
 BOBOT_HIST = 0.45
-SKOR_MIN   = 0.35
+SKOR_MIN  = 0.35
 
 # =============================================
 #  LOAD PROFIL
@@ -93,16 +82,15 @@ def load_profil():
     if os.path.exists(path):
         with open(path, "r") as f:
             data = json.load(f)
-        print(f"[PROFIL] Dimuat dari file: {list(data.keys())}")
+        print(f"[PROFIL] Dimuat: {list(data.keys())}")
         return data
-    else:
-        print("[PROFIL] profil_hsv.json tidak ditemukan, pakai profil fallback.")
-        return PROFIL_FALLBACK
+    print("[PROFIL] Pakai profil fallback.")
+    return PROFIL_FALLBACK
 
 profil_data = load_profil()
 
 # =============================================
-#  FUNGSI DETEKSI (tanpa GUI)
+#  FUNGSI DETEKSI
 # =============================================
 
 def buat_mask_kaca(hsv_img):
@@ -119,8 +107,9 @@ def skor_hsv(frame_hsv, mask_kaca, lower, upper):
     total = cv2.countNonZero(mask_kaca)
     if total == 0:
         return 0.0
-    mask_hsv = cv2.inRange(frame_hsv, np.array(lower, dtype=np.uint8),
-                                       np.array(upper, dtype=np.uint8))
+    mask_hsv = cv2.inRange(frame_hsv,
+                           np.array(lower, dtype=np.uint8),
+                           np.array(upper, dtype=np.uint8))
     mask_hsv = cv2.bitwise_and(mask_hsv, mask_kaca)
     k        = np.ones((5, 5), np.uint8)
     mask_hsv = cv2.morphologyEx(mask_hsv, cv2.MORPH_OPEN,   k)
@@ -130,27 +119,26 @@ def skor_hsv(frame_hsv, mask_kaca, lower, upper):
 
 def skor_histogram(frame_hsv, mask_kaca, hist_h_ref, hist_s_ref):
     if not hist_h_ref or not hist_s_ref:
-        return 0.0   # tidak ada referensi histogram, skip
+        return 0.0
     valid_px = frame_hsv[mask_kaca == 255]
     if len(valid_px) < 100:
         return 0.0
-    h_arr = valid_px[:, 0]
-    s_arr = valid_px[:, 1]
+    h_arr    = valid_px[:, 0]
+    s_arr    = valid_px[:, 1]
     hist_h_f = cv2.calcHist([h_arr], [0], None, [180], [0, 180])
     hist_s_f = cv2.calcHist([s_arr], [0], None, [256], [0, 256])
     cv2.normalize(hist_h_f, hist_h_f)
     cv2.normalize(hist_s_f, hist_s_f)
-    ref_h = np.array(hist_h_ref, dtype=np.float32).reshape(-1, 1)
-    ref_s = np.array(hist_s_ref, dtype=np.float32).reshape(-1, 1)
+    ref_h    = np.array(hist_h_ref, dtype=np.float32).reshape(-1, 1)
+    ref_s    = np.array(hist_s_ref, dtype=np.float32).reshape(-1, 1)
     cv2.normalize(ref_h, ref_h)
     cv2.normalize(ref_s, ref_s)
-    dist_h = cv2.compareHist(hist_h_f, ref_h, cv2.HISTCMP_BHATTACHARYYA)
-    dist_s = cv2.compareHist(hist_s_f, ref_s, cv2.HISTCMP_BHATTACHARYYA)
+    dist_h   = cv2.compareHist(hist_h_f, ref_h, cv2.HISTCMP_BHATTACHARYYA)
+    dist_s   = cv2.compareHist(hist_s_f, ref_s, cv2.HISTCMP_BHATTACHARYYA)
     return ((1 - dist_h) + (1 - dist_s)) / 2.0
 
 
 def deteksi_warna(jpeg_bytes: bytes):
-    """Proses bytes JPEG → return (label, status, skor)."""
     img_array = np.frombuffer(jpeg_bytes, dtype=np.uint8)
     frame     = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
     if frame is None:
@@ -184,7 +172,7 @@ def deteksi_warna(jpeg_bytes: bytes):
     return "tidak terdeteksi", "-", 0.0
 
 # =============================================
-#  SIMPAN HASIL KE FILE (untuk bot_telegram baca)
+#  SIMPAN / BACA HASIL
 # =============================================
 
 HASIL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hasil_warna.json")
@@ -200,31 +188,25 @@ def baca_hasil() -> dict:
         return json.load(f)
 
 # =============================================
-#  ENDPOINT: POST /upload_foto
+#  ROUTES
 # =============================================
 
 @app.route("/upload_foto", methods=["POST"])
 def upload_foto():
-    """Terima foto JPEG dari ESP32-CAM, proses warna, simpan hasil."""
     try:
-        device_id = request.form.get("device_id", "unknown")
+        device_id  = request.form.get("device_id", "unknown")
 
-        # Ambil file foto
         if "foto" not in request.files:
             return jsonify({"ok": False, "error": "Tidak ada field 'foto'"}), 400
 
-        foto_file  = request.files["foto"]
-        jpeg_bytes = foto_file.read()
-
+        jpeg_bytes = request.files["foto"].read()
         if len(jpeg_bytes) < 100:
             return jsonify({"ok": False, "error": "File terlalu kecil"}), 400
 
         print(f"[UPLOAD] {device_id} — {len(jpeg_bytes)} bytes")
 
-        # Deteksi warna
         label, status, skor = deteksi_warna(jpeg_bytes)
 
-        # Simpan hasil
         hasil = {
             "warna"       : label,
             "status_warna": status,
@@ -238,43 +220,25 @@ def upload_foto():
             _hasil_warna.update(hasil)
 
         print(f"[DETEKSI] {label} | {status} | skor={skor}")
-
-        return jsonify({
-            "ok"          : True,
-            "warna"       : label,
-            "status_warna": status,
-            "skor"        : skor,
-        })
+        return jsonify({"ok": True, "warna": label, "status_warna": status, "skor": skor})
 
     except Exception as e:
         print(f"[ERROR /upload_foto] {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# =============================================
-#  ENDPOINT: GET /hasil_warna
-# =============================================
-
 @app.route("/hasil_warna", methods=["GET"])
 def hasil_warna():
-    """Kembalikan hasil deteksi warna terakhir (dipanggil bot_telegram)."""
     data = baca_hasil()
-
-    # Hitung menit_lalu
     if data.get("timestamp"):
         try:
-            ts        = datetime.fromisoformat(data["timestamp"])
-            selisih   = (datetime.now() - ts).total_seconds()
+            ts             = datetime.fromisoformat(data["timestamp"])
+            selisih        = (datetime.now() - ts).total_seconds()
             data["menit_lalu"] = int(selisih / 60)
         except:
             data["menit_lalu"] = None
-
     return jsonify(data)
 
-
-# =============================================
-#  ENDPOINT: GET /health
-# =============================================
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -282,21 +246,35 @@ def health():
 
 
 # =============================================
-#  MAIN
+#  MAIN — jalankan Flask + Bot Telegram
 # =============================================
 
-def run_bot_thread():
-    import subprocess, sys
-    subprocess.Popen([sys.executable, "bot_telegram.py"])
+def run_bot():
+    """Jalankan bot_telegram.py sebagai subprocess."""
+    print("[BOT] Memulai bot_telegram.py...")
+    bot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_telegram.py")
+    process  = subprocess.Popen(
+        [sys.executable, bot_path],
+        stdout=sys.stdout,
+        stderr=sys.stderr
+    )
+    process.wait()
+    print("[BOT] bot_telegram.py berhenti!")
+
 
 if __name__ == "__main__":
-    import threading
     port = int(os.environ.get("PORT", 5000))
-    print(f"[WARNA ENDPOINT] Jalan di port {port}")
-    
-    # Jalankan bot telegram sebagai subprocess
-    t = threading.Thread(target=run_bot_thread, daemon=True)
-    t.start()
-    print("[BOT] Bot telegram dimulai sebagai subprocess")
-    
-    app.run(host="0.0.0.0", port=port, debug=False)
+
+    print("=" * 50)
+    print("Warna Endpoint + Bot Telegram - Railway")
+    print("=" * 50)
+    print(f"[FLASK] Port: {port}")
+    print(f"[FLASK] Endpoints: /upload_foto | /hasil_warna | /health")
+
+    # Bot telegram di background thread
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    print("[BOT] Thread dimulai")
+
+    # Flask di main thread
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
