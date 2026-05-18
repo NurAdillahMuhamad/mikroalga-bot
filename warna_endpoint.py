@@ -285,8 +285,18 @@ def health():
 #  MAIN
 # =============================================
 
+def run_bot_thread():
+    import subprocess, sys
+    subprocess.Popen([sys.executable, "bot_telegram.py"])
+
 if __name__ == "__main__":
+    import threading
     port = int(os.environ.get("PORT", 5000))
     print(f"[WARNA ENDPOINT] Jalan di port {port}")
-    print(f"[WARNA ENDPOINT] Endpoint: POST /upload_foto | GET /hasil_warna")
+    
+    # Jalankan bot telegram sebagai subprocess
+    t = threading.Thread(target=run_bot_thread, daemon=True)
+    t.start()
+    print("[BOT] Bot telegram dimulai sebagai subprocess")
+    
     app.run(host="0.0.0.0", port=port, debug=False)
