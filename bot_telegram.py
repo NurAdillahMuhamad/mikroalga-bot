@@ -38,6 +38,8 @@ PH_MIN   = 8.5
 PH_MAX   = 10.5
 LUX_MIN  = 100
 
+HASIL_WARNA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hasil_warna.json")
+
 # ================================================================
 #  GOOGLE DRIVE — baca token dari ENV, bukan file
 # ================================================================
@@ -168,11 +170,63 @@ def get_latest_photos(drive_service, jumlah=5):
 # ================================================================
 
 def get_sensor_data():
-    try:
-        r = requests.get(API_SENSOR_URL, timeout=8)
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)}
+    
+    """
+    Baca hasil deteksi warna dari hasil_warna.json
+    (file ini ditulis oleh warna_endpoint.py saat ESP32 upload foto).
+    Juga tetap ambil data pH/cahaya dari API sensor lama (kalau ada).
+    """
+    hasil = {
+        "warna"        : "tidak terdeteksi",
+        "status_warna" : "-",
+        "skor"         : 0.0,
+        "menit_lalu"   : None,
+        # Data sensor lain (default)
+        "pH"           : "—",
+        "pH_status"    : "normal",
+        "cahaya"       : "—",
+        "uv"           : "OFF",
+        "pompa_basa"   : "IDLE",
+        "pompa_normal" : "IDLE",
+    }
+ 
+    # 1. Baca hasil warna dari file lokal
+    if os.path.exists(HASIL_WARNA_PATH):
+        try:
+            with open(HASIL_WARNA_PATH, "r") as f:
+                data_warna = json.load(f)
+            hasil.update({
+                "warna"       : data_warna.get("warna", "tidak terdeteksi"),
+                "status_warna": data_warna.get("status_warna", "-"),
+                "skor"        : data_warna.get("skor", 0.0),
+            })
+            # Hitung menit_lalu
+            ts_str = data_warna.get("timestamp")
+            if ts_str:
+                ts     = datetime.fromisoformat(ts_str)
+                selisih = (datetime.now() - ts).total_seconds()
+                hasil["menit_lalu"] = int(selisih / 60)
+        except Exception as e:
+            print(f"[SENSOR] Gagal baca hasil_warna.json: {e}")
+ 
+    # 2. Tetap coba ambil data pH/cahaya dari sensor PHP (opsional)
+    #    Kalau tidak pakai sensor PHP, hapus blok ini.
+    API_SENSOR_URL = os.environ.get("API_SENSOR_URL", "")
+    if API_SENSOR_URL:
+        try:
+            import requests
+            r = requests.get(API_SENSOR_URL, timeout=8)
+            data_sensor = r.json()
+            # Merge data sensor, warna tetap dari ESP32
+            for key in ["pH", "pH_status", "cahaya", "uv", "pompa_basa", "pompa_normal"]:
+                if key in data_sensor:
+                    hasil[key] = data_sensor[key]
+            if "menit_lalu" in data_sensor and hasil["menit_lalu"] is None:
+                hasil["menit_lalu"] = data_sensor["menit_lalu"]
+        except Exception as e:
+            print(f"[SENSOR] Gagal ambil data sensor pH: {e}")
+ 
+    return hasil
 
 
 def format_status(s: dict) -> str:
