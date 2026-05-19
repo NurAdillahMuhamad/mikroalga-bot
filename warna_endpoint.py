@@ -277,7 +277,7 @@ def run_http_esp32():
     server.serve_forever()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8080))
 
     print("=" * 50)
     print("Warna Endpoint + Bot Telegram - Railway")
@@ -285,12 +285,18 @@ if __name__ == "__main__":
     print(f"[FLASK] Port: {port}")
     print(f"[FLASK] Endpoints: /upload_foto | /hasil_warna | /health")
 
+    # HTTP server khusus ESP32 di port 8081 (tanpa SSL)
+    import threading
+    from wsgiref.simple_server import make_server
+    def run_http():
+        srv = make_server('0.0.0.0', 8081, app)
+        print("[ESP32] HTTP server port 8081 ready")
+        srv.serve_forever()
+    threading.Thread(target=run_http, daemon=True).start()
+
     # Bot telegram di background thread
     bot_thread = threading.Thread(target=run_bot, daemon=True)
-    esp32_thread = threading.Thread(target=run_http_esp32, daemon=True)
-    esp32_thread.start()
     bot_thread.start()
     print("[BOT] Thread dimulai")
 
-    # Flask di main thread
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
