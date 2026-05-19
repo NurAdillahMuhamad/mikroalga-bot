@@ -269,10 +269,11 @@ def run_bot():
         time.sleep(30)
 
 def run_http_esp32():
-    """Server HTTP plain di port 8081 khusus ESP32 tanpa SSL."""
-    from wsgiref.simple_server import make_server
-    server = make_server('0.0.0.0', 8081, app)
-    print("[ESP32] HTTP server port 8081 siap")
+    from wsgiref.simple_server import make_server, WSGIRequestHandler
+    class SilentHandler(WSGIRequestHandler):
+        def log_message(self, format, *args): pass
+    server = make_server('0.0.0.0', 8081, app, handler_class=SilentHandler)
+    print("[ESP32] HTTP server port 8081 ready")
     server.serve_forever()
 
 if __name__ == "__main__":
@@ -286,8 +287,8 @@ if __name__ == "__main__":
 
     # Bot telegram di background thread
     bot_thread = threading.Thread(target=run_bot, daemon=True)
-    esp_thread = threading.Thread(target=run_http_esp32, daemon=True)
-    esp_thread.start()
+    esp32_thread = threading.Thread(target=run_http_esp32, daemon=True)
+    esp32_thread.start()
     bot_thread.start()
     print("[BOT] Thread dimulai")
 
