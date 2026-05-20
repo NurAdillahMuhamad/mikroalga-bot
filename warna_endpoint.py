@@ -1,10 +1,11 @@
 """
-warna_endpoint.py - FINAL VERSION
+warna_endpoint.py - FINAL VERSION + Google Drive Upload
 ====================================
 Flask endpoint + Bot Telegram dalam satu process.
 - Flask terima foto dari ESP32-CAM (POST /upload_foto)
 - Bot Telegram jalan sebagai subprocess
 - Hasil deteksi disimpan ke hasil_warna.json
+- Setiap foto diupload ke Google Drive (folder per tanggal DD-MM-YYYY)
 """
 
 import os
@@ -72,6 +73,130 @@ PROFIL_FALLBACK = {
 BOBOT_HSV = 0.55
 BOBOT_HIST = 0.45
 SKOR_MIN  = 0.35
+
+# =============================================
+#  GOOGLE DRIVE CONFIG
+# =============================================
+
+GDRIVE_PARENT_FOLDER_ID = "17ISXne7N15wOEdZwwdW_lGtJWGUHiTbc"
+
+# Cache folder ID per tanggal agar tidak buat ulang tiap foto
+_gdrive_folder_cache = {}   # {"DD-MM-YYYY": "folder_id"}
+_gdrive_lock = threading.Lock()
+
+
+def _get_gdrive_service():
+    """
+    Buat Google Drive service dari GOOGLE_TOKEN_JSON env variable.
+    Env variable berisi JSON string hasil export credentials OAuth2.
+    """
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    token_json = os.environ.get("GOOGLE_TOKEN_JSON")
+    if not token_json:
+        raise ValueError("Env variable GOOGLE_TOKEN_JSON tidak ditemukan")
+
+    token_data = json.loads(token_json)
+    creds = Credentials(
+        token=token_data.get("token"),
+        refresh_token=token_data.get("refresh_token"),
+        token_uri=token_data.get("token_uri", "https://oauth2.googleapis.com/token"),
+        client_id=token_data.get("client_id"),
+        client_secret=token_data.get("client_secret"),
+        scopes=token_data.get("scopes", ["https://www.googleapis.com/auth/drive"]),
+    )
+
+    # Auto-refresh token kalau sudah expired
+    if creds.expired and creds.refresh_token:
+        from google.auth.transport.requests import Request
+        creds.refresh(Request())
+
+    service = build("drive", "v3", credentials=creds)
+    return service
+
+
+def _get_atau_buat_folder(service, nama_folder, parent_id):
+    """
+    Cari folder dengan nama tertentu di dalam parent_id.
+    Kalau tidak ada, buat baru. Return folder_id.
+    """
+    query = (
+        f"name='{nama_folder}' "
+        f"and '{parent_id}' in parents "
+        f"and mimeType='application/vnd.google-apps.folder' "
+        f"and trashed=false"
+    )
+    hasil = service.files().list(q=query, fields="files(id, name)").execute()
+    files = hasil.get("files", [])
+
+    if files:
+        return files[0]["id"]
+
+    # Buat folder baru
+    metadata = {
+        "name": nama_folder,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    folder = service.files().create(body=metadata, fields="id").execute()
+    print(f"[GDRIVE] Folder baru dibuat: {nama_folder} → {folder['id']}")
+    return folder["id"]
+
+
+def upload_ke_gdrive(jpeg_bytes: bytes, device_id: str, timestamp: str):
+    """
+    Upload foto JPEG ke Google Drive.
+    - Folder: DD-MM-YYYY (otomatis dibuat jika belum ada)
+    - Nama file: HHMMSS_device_id.jpg
+    Dipanggil dari thread terpisah (non-blocking).
+    """
+    try:
+        from googleapiclient.http import MediaIoBaseUpload
+
+        service = _get_gdrive_service()
+
+        # Tentukan nama folder dari tanggal
+        try:
+            ts = datetime.fromisoformat(timestamp)
+        except Exception:
+            ts = datetime.now()
+
+        nama_folder = ts.strftime("%d-%m-%Y")
+        nama_file   = ts.strftime("%H%M%S") + f"_{device_id}.jpg"
+
+        # Ambil folder_id dari cache, atau cari/buat
+        with _gdrive_lock:
+            if nama_folder not in _gdrive_folder_cache:
+                folder_id = _get_atau_buat_folder(
+                    service, nama_folder, GDRIVE_PARENT_FOLDER_ID
+                )
+                _gdrive_folder_cache[nama_folder] = folder_id
+            else:
+                folder_id = _gdrive_folder_cache[nama_folder]
+
+        # Upload file
+        metadata = {
+            "name": nama_file,
+            "parents": [folder_id],
+        }
+        media = MediaIoBaseUpload(
+            io.BytesIO(jpeg_bytes),
+            mimetype="image/jpeg",
+            resumable=False,
+        )
+        uploaded = service.files().create(
+            body=metadata,
+            media_body=media,
+            fields="id, name",
+        ).execute()
+
+        print(f"[GDRIVE] Upload sukses: {nama_folder}/{nama_file} → {uploaded['id']}")
+
+    except Exception as e:
+        # Jangan sampai error Google Drive ganggu respons ke ESP32
+        print(f"[GDRIVE ERROR] {e}")
+
 
 # =============================================
 #  LOAD PROFIL
@@ -207,12 +332,13 @@ def upload_foto():
 
         label, status, skor = deteksi_warna(jpeg_bytes)
 
+        timestamp_now = datetime.now().isoformat()
         hasil = {
             "warna"       : label,
             "status_warna": status,
             "skor"        : skor,
             "device_id"   : device_id,
-            "timestamp"   : datetime.now().isoformat(),
+            "timestamp"   : timestamp_now,
         }
         simpan_hasil(hasil)
 
@@ -220,6 +346,14 @@ def upload_foto():
             _hasil_warna.update(hasil)
 
         print(f"[DETEKSI] {label} | {status} | skor={skor}")
+
+        # Upload ke Google Drive — non-blocking (jalan di thread terpisah)
+        threading.Thread(
+            target=upload_ke_gdrive,
+            args=(jpeg_bytes, device_id, timestamp_now),
+            daemon=True,
+        ).start()
+
         return jsonify({"ok": True, "warna": label, "status_warna": status, "skor": skor})
 
     except Exception as e:
@@ -249,13 +383,11 @@ def health():
 #  MAIN — jalankan Flask + Bot Telegram
 # =============================================
 
-# SESUDAH ✅
 def run_bot():
     import time
-    # Tunggu 20 detik dulu — beri waktu instance Railway lama benar-benar mati
     print("[BOT] Menunggu 20 detik sebelum start...")
     time.sleep(20)
-    
+
     bot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_telegram.py")
     while True:
         print("[BOT] Memulai bot_telegram.py...")
@@ -286,7 +418,6 @@ if __name__ == "__main__":
     print(f"[FLASK] Endpoints: /upload_foto | /hasil_warna | /health")
 
     # HTTP server khusus ESP32 di port 8081 (tanpa SSL)
-    import threading
     from wsgiref.simple_server import make_server
     def run_http():
         srv = make_server('0.0.0.0', 8081, app)
