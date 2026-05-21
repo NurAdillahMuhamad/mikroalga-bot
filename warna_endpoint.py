@@ -1,11 +1,12 @@
 """
-warna_endpoint.py - FINAL VERSION + Google Drive Upload
+warna_endpoint.py - FINAL VERSION + Pompa Nutrisi
 ====================================
 Flask endpoint + Bot Telegram dalam satu process.
 - Flask terima foto dari ESP32-CAM (POST /upload_foto)
 - Bot Telegram jalan sebagai subprocess
-- Hasil deteksi disimpan ke hasil_warna.json
+- Hasil deteksi disimpan ke hasil_warna.json DAN MySQL
 - Setiap foto diupload ke Google Drive (folder per tanggal DD-MM-YYYY)
+- Logika pompa nutrisi: terjadwal + darurat
 """
 
 import os
@@ -16,10 +17,257 @@ import subprocess
 import sys
 import numpy as np
 import cv2
+import pymysql
+import pymysql.cursors
 from flask import Flask, request, jsonify
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
+
+# =============================================
+#  KONFIGURASI POMPA NUTRISI
+# =============================================
+
+# Ganti TESTING_MODE = False dan pakai INTERVAL_PRODUKSI untuk produksi
+TESTING_MODE = True
+
+INTERVAL_POMPA_DETIK = 3 * 60          # 3 menit (testing)
+# INTERVAL_POMPA_DETIK = 3 * 24 * 3600  # 3 hari (produksi)
+
+V_MEDIA_LITER = 45.0  # Volume kolam dalam liter
+
+# Konstanta K nutrisi per fase (mL/L)
+KONSTANTA_NUTRISI = {
+    "Fase 1: Pembibitan" : 0.2,
+    "Fase 2: Pertumbuhan": 0.4,
+    "Fase 3: Optimal"    : 0.3,
+    "Fase 4: Panen"      : 0.1,
+}
+
+# Urutan fase untuk deteksi mundur
+URUTAN_FASE = [
+    "Fase 1: Pembibitan",
+    "Fase 2: Pertumbuhan",
+    "Fase 3: Optimal",
+    "Fase 4: Panen",
+]
+
+PH_NORMAL_MIN = 8.5
+PH_NORMAL_MAX = 9.0
+
+# =============================================
+#  KONEKSI DATABASE
+# =============================================
+
+def get_db():
+    """Buat koneksi MySQL dari environment variable Railway."""
+    return pymysql.connect(
+        host     = os.environ.get("MYSQLHOST",     "localhost"),
+        port     = int(os.environ.get("MYSQLPORT", "3306")),
+        user     = os.environ.get("MYSQLUSER",     "root"),
+        password = os.environ.get("MYSQLPASSWORD", ""),
+        database = os.environ.get("MYSQLDATABASE", "railway"),
+        charset  = "utf8mb4",
+        cursorclass = pymysql.cursors.DictCursor,
+        connect_timeout = 10,
+    )
+
+# =============================================
+#  LOGIKA POMPA NUTRISI
+# =============================================
+
+def get_ph_terbaru():
+    """Ambil nilai pH terbaru dari database."""
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT pH FROM mikroalga_sensor "
+                "WHERE pH IS NOT NULL "
+                "ORDER BY waktu DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+        db.close()
+        if row and row["pH"] is not None:
+            return float(row["pH"])
+        return None
+    except Exception as e:
+        print(f"[DB] Gagal ambil pH: {e}")
+        return None
+
+
+def get_waktu_pompa_terakhir():
+    """Ambil waktu terakhir pompa nutrisi aktif dari database."""
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT waktu FROM mikroalga_sensor "
+                "WHERE pompa_normal = 'ON' "
+                "ORDER BY waktu DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+        db.close()
+        if row and row["waktu"]:
+            return row["waktu"]  # datetime object
+        return None
+    except Exception as e:
+        print(f"[DB] Gagal ambil waktu pompa terakhir: {e}")
+        return None
+
+
+def get_fase_sebelumnya():
+    """Ambil fase sebelumnya dari record terbaru di database."""
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT warna, fase_sebelumnya FROM mikroalga_sensor "
+                "WHERE warna IS NOT NULL AND warna != 'tidak terdeteksi' "
+                "ORDER BY waktu DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+        db.close()
+        if row:
+            return row.get("fase_sebelumnya"), row.get("warna")
+        return None, None
+    except Exception as e:
+        print(f"[DB] Gagal ambil fase sebelumnya: {e}")
+        return None, None
+
+
+def hitung_volume_nutrisi(fase_label):
+    """Hitung volume nutrisi berdasarkan fase saat ini."""
+    k = KONSTANTA_NUTRISI.get(fase_label, 0.0)
+    return round(k * V_MEDIA_LITER, 2)
+
+
+def cek_fase_mundur(fase_sekarang, fase_sebelumnya):
+    """
+    Return True kalau fase sekarang lebih rendah dari fase sebelumnya.
+    Contoh: Fase 3 → Fase 2 = mundur
+    """
+    if not fase_sekarang or not fase_sebelumnya:
+        return False
+    if fase_sekarang not in URUTAN_FASE or fase_sebelumnya not in URUTAN_FASE:
+        return False
+    idx_sekarang   = URUTAN_FASE.index(fase_sekarang)
+    idx_sebelumnya = URUTAN_FASE.index(fase_sebelumnya)
+    return idx_sekarang < idx_sebelumnya
+
+
+def cek_pompa_nutrisi(fase_sekarang):
+    """
+    Putuskan apakah pompa nutrisi harus ON.
+    Return: (harus_on: bool, alasan: str, volume_ml: float)
+    """
+    if not fase_sekarang or fase_sekarang == "tidak terdeteksi":
+        return False, "fase tidak terdeteksi", 0.0
+
+    volume = hitung_volume_nutrisi(fase_sekarang)
+    ph     = get_ph_terbaru()
+
+    # Cek fase mundur
+    fase_sebelumnya_db, _ = get_fase_sebelumnya()
+    fase_mundur = cek_fase_mundur(fase_sekarang, fase_sebelumnya_db)
+
+    # Cek pH darurat
+    ph_darurat = False
+    if ph is not None:
+        ph_darurat = (ph < PH_NORMAL_MIN or ph > PH_NORMAL_MAX)
+
+    # Cek timer — sudah lewat interval sejak pompa terakhir?
+    waktu_terakhir = get_waktu_pompa_terakhir()
+    sudah_waktunya = False
+    if waktu_terakhir is None:
+        # Belum pernah pompa sama sekali → langsung aktif
+        sudah_waktunya = True
+    else:
+        selisih = (datetime.now() - waktu_terakhir).total_seconds()
+        sudah_waktunya = selisih >= INTERVAL_POMPA_DETIK
+
+    # ── Logika keputusan ──────────────────────────────────────
+    # Darurat: langsung ON tanpa tunggu timer
+    if fase_mundur and ph_darurat:
+        return True, f"DARURAT: fase mundur ({fase_sebelumnya_db}→{fase_sekarang}) + pH={ph}", volume
+
+    if fase_mundur:
+        return True, f"DARURAT: fase mundur ({fase_sebelumnya_db}→{fase_sekarang})", volume
+
+    if ph_darurat:
+        alasan_ph = f"pH rendah ({ph})" if ph < PH_NORMAL_MIN else f"pH tinggi ({ph})"
+        return True, f"DARURAT: {alasan_ph}", volume
+
+    # Terjadwal: ON kalau sudah waktunya
+    if sudah_waktunya:
+        mode = "testing 3 menit" if TESTING_MODE else "produksi 3 hari"
+        return True, f"TERJADWAL ({mode})", volume
+
+    return False, "belum waktunya", 0.0
+
+
+def update_status_pompa_db(pompa_on: bool, volume_ml: float, alasan: str):
+    """Update status pompa_normal di tabel status_pompa."""
+    try:
+        db  = get_db()
+        status = "ON" if pompa_on else "OFF"
+        with db.cursor() as cur:
+            cur.execute(
+                "UPDATE status_pompa SET pompa_normal = %s WHERE id = 1",
+                (status,)
+            )
+        db.commit()
+        db.close()
+        print(f"[POMPA] Status DB diupdate: {status} | {alasan} | {volume_ml} mL")
+    except Exception as e:
+        print(f"[DB] Gagal update status pompa: {e}")
+
+# =============================================
+#  INSERT SENSOR KE DATABASE
+# =============================================
+
+def insert_sensor_db(label, status, skor, fase_sebelumnya_val):
+    """
+    INSERT hasil deteksi warna ke tabel mikroalga_sensor.
+    pompa_normal diisi berdasarkan hasil cek_pompa_nutrisi().
+    """
+    try:
+        # Cek pompa dulu
+        pompa_on, alasan, volume_ml = cek_pompa_nutrisi(label)
+
+        # Update status_pompa table
+        update_status_pompa_db(pompa_on, volume_ml, alasan)
+
+        pompa_normal_val = "ON" if pompa_on else "IDLE"
+
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO mikroalga_sensor
+                    (warna, status_warna, persentase_warna,
+                     pompa_normal, fase_sebelumnya)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    label,
+                    status,
+                    round(skor * 100, 1),
+                    pompa_normal_val,
+                    fase_sebelumnya_val,
+                )
+            )
+        db.commit()
+        db.close()
+        print(f"[DB] INSERT warna OK | pompa_normal={pompa_normal_val} | {alasan}")
+
+        if pompa_on:
+            print(f"[POMPA] 🟢 AKTIF | Alasan: {alasan} | Volume: {volume_ml} mL")
+        return pompa_on, alasan, volume_ml
+
+    except Exception as e:
+        print(f"[DB] Gagal INSERT sensor: {e}")
+        return False, "db error", 0.0
 
 # =============================================
 #  STATE
@@ -80,16 +328,11 @@ SKOR_MIN  = 0.35
 
 GDRIVE_PARENT_FOLDER_ID = "17ISXne7N15wOEdZwwdW_lGtJWGUHiTbc"
 
-# Cache folder ID per tanggal agar tidak buat ulang tiap foto
-_gdrive_folder_cache = {}   # {"DD-MM-YYYY": "folder_id"}
+_gdrive_folder_cache = {}
 _gdrive_lock = threading.Lock()
 
 
 def _get_gdrive_service():
-    """
-    Buat Google Drive service dari GOOGLE_TOKEN_JSON env variable.
-    Env variable berisi JSON string hasil export credentials OAuth2.
-    """
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
 
@@ -106,21 +349,13 @@ def _get_gdrive_service():
         client_secret=token_data.get("client_secret"),
         scopes=token_data.get("scopes", ["https://www.googleapis.com/auth/drive"]),
     )
-
-    # Auto-refresh token kalau sudah expired
     if creds.expired and creds.refresh_token:
         from google.auth.transport.requests import Request
         creds.refresh(Request())
-
-    service = build("drive", "v3", credentials=creds)
-    return service
+    return build("drive", "v3", credentials=creds)
 
 
 def _get_atau_buat_folder(service, nama_folder, parent_id):
-    """
-    Cari folder dengan nama tertentu di dalam parent_id.
-    Kalau tidak ada, buat baru. Return folder_id.
-    """
     query = (
         f"name='{nama_folder}' "
         f"and '{parent_id}' in parents "
@@ -129,11 +364,8 @@ def _get_atau_buat_folder(service, nama_folder, parent_id):
     )
     hasil = service.files().list(q=query, fields="files(id, name)").execute()
     files = hasil.get("files", [])
-
     if files:
         return files[0]["id"]
-
-    # Buat folder baru
     metadata = {
         "name": nama_folder,
         "mimeType": "application/vnd.google-apps.folder",
@@ -145,58 +377,31 @@ def _get_atau_buat_folder(service, nama_folder, parent_id):
 
 
 def upload_ke_gdrive(jpeg_bytes: bytes, device_id: str, timestamp: str):
-    """
-    Upload foto JPEG ke Google Drive.
-    - Folder: DD-MM-YYYY (otomatis dibuat jika belum ada)
-    - Nama file: HHMMSS_device_id.jpg
-    Dipanggil dari thread terpisah (non-blocking).
-    """
     try:
         from googleapiclient.http import MediaIoBaseUpload
-
         service = _get_gdrive_service()
-
-        # Tentukan nama folder dari tanggal
         try:
             ts = datetime.fromisoformat(timestamp)
         except Exception:
             ts = datetime.now()
-
         nama_folder = ts.strftime("%d-%m-%Y")
         nama_file   = ts.strftime("%H%M%S") + f"_{device_id}.jpg"
-
-        # Ambil folder_id dari cache, atau cari/buat
         with _gdrive_lock:
             if nama_folder not in _gdrive_folder_cache:
-                folder_id = _get_atau_buat_folder(
-                    service, nama_folder, GDRIVE_PARENT_FOLDER_ID
-                )
+                folder_id = _get_atau_buat_folder(service, nama_folder, GDRIVE_PARENT_FOLDER_ID)
                 _gdrive_folder_cache[nama_folder] = folder_id
             else:
                 folder_id = _gdrive_folder_cache[nama_folder]
-
-        # Upload file
-        metadata = {
-            "name": nama_file,
-            "parents": [folder_id],
-        }
+        metadata = {"name": nama_file, "parents": [folder_id]}
         media = MediaIoBaseUpload(
-            io.BytesIO(jpeg_bytes),
-            mimetype="image/jpeg",
-            resumable=False,
+            io.BytesIO(jpeg_bytes), mimetype="image/jpeg", resumable=False
         )
         uploaded = service.files().create(
-            body=metadata,
-            media_body=media,
-            fields="id, name",
+            body=metadata, media_body=media, fields="id, name"
         ).execute()
-
         print(f"[GDRIVE] Upload sukses: {nama_folder}/{nama_file} → {uploaded['id']}")
-
     except Exception as e:
-        # Jangan sampai error Google Drive ganggu respons ke ESP32
         print(f"[GDRIVE ERROR] {e}")
-
 
 # =============================================
 #  LOAD PROFIL
@@ -319,7 +524,7 @@ def baca_hasil() -> dict:
 @app.route("/upload_foto", methods=["POST"])
 def upload_foto():
     try:
-        device_id  = request.form.get("device_id", "unknown")
+        device_id = request.form.get("device_id", "unknown")
 
         if "foto" not in request.files:
             return jsonify({"ok": False, "error": "Tidak ada field 'foto'"}), 400
@@ -333,6 +538,12 @@ def upload_foto():
         label, status, skor = deteksi_warna(jpeg_bytes)
 
         timestamp_now = datetime.now().isoformat()
+
+        # Ambil fase sebelumnya SEBELUM INSERT (untuk tracking mundur)
+        fase_sebelumnya_lama, fase_db_terakhir = get_fase_sebelumnya()
+        # fase_sebelumnya yang disimpan = fase yang terdeteksi sebelum ini
+        fase_untuk_disimpan = fase_db_terakhir if fase_db_terakhir else None
+
         hasil = {
             "warna"       : label,
             "status_warna": status,
@@ -347,18 +558,61 @@ def upload_foto():
 
         print(f"[DETEKSI] {label} | {status} | skor={skor}")
 
-        # Upload ke Google Drive — non-blocking (jalan di thread terpisah)
+        # INSERT ke database + cek pompa nutrisi
+        pompa_on, alasan, volume_ml = insert_sensor_db(
+            label, status, skor, fase_untuk_disimpan
+        )
+
+        # Update hasil_warna.json dengan info pompa
+        hasil["pompa_nutrisi"] = "ON" if pompa_on else "OFF"
+        hasil["pompa_alasan"]  = alasan
+        hasil["volume_ml"]     = volume_ml
+        simpan_hasil(hasil)
+
+        # Upload ke Google Drive — non-blocking
         threading.Thread(
             target=upload_ke_gdrive,
             args=(jpeg_bytes, device_id, timestamp_now),
             daemon=True,
         ).start()
 
-        return jsonify({"ok": True, "warna": label, "status_warna": status, "skor": skor})
+        return jsonify({
+            "ok"           : True,
+            "warna"        : label,
+            "status_warna" : status,
+            "skor"         : skor,
+            "pompa_nutrisi": "ON" if pompa_on else "OFF",
+            "volume_ml"    : volume_ml,
+            "alasan"       : alasan,
+        })
 
     except Exception as e:
         print(f"[ERROR /upload_foto] {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/status_pompa_nutrisi", methods=["GET"])
+def status_pompa_nutrisi():
+    """
+    Endpoint untuk ESP32 — GET status pompa nutrisi saat ini.
+    ESP32 panggil ini setiap loop, lalu aktifkan RELAY_NUTRISI sesuai hasilnya.
+    """
+    try:
+        data = baca_hasil()
+        fase = data.get("warna", "tidak terdeteksi")
+
+        pompa_on, alasan, volume_ml = cek_pompa_nutrisi(fase)
+
+        return jsonify({
+            "pompa_nutrisi": "ON" if pompa_on else "OFF",
+            "volume_ml"    : volume_ml,
+            "alasan"       : alasan,
+            "fase"         : fase,
+            "interval_mode": "testing" if TESTING_MODE else "produksi",
+        })
+    except Exception as e:
+        print(f"[ERROR /status_pompa_nutrisi] {e}")
+        return jsonify({"pompa_nutrisi": "OFF", "error": str(e)}), 500
 
 
 @app.route("/hasil_warna", methods=["GET"])
@@ -376,7 +630,12 @@ def hasil_warna():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
+    return jsonify({
+        "status"       : "ok",
+        "timestamp"    : datetime.now().isoformat(),
+        "testing_mode" : TESTING_MODE,
+        "interval_detik": INTERVAL_POMPA_DETIK,
+    })
 
 
 # =============================================
@@ -400,22 +659,16 @@ def run_bot():
         print("[BOT] bot_telegram.py berhenti! Restart dalam 30 detik...")
         time.sleep(30)
 
-def run_http_esp32():
-    from wsgiref.simple_server import make_server, WSGIRequestHandler
-    class SilentHandler(WSGIRequestHandler):
-        def log_message(self, format, *args): pass
-    server = make_server('0.0.0.0', 8081, app, handler_class=SilentHandler)
-    print("[ESP32] HTTP server port 8081 ready")
-    server.serve_forever()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
 
     print("=" * 50)
-    print("Warna Endpoint + Bot Telegram - Railway")
+    print("Warna Endpoint + Bot Telegram + Pompa Nutrisi")
     print("=" * 50)
     print(f"[FLASK] Port: {port}")
-    print(f"[FLASK] Endpoints: /upload_foto | /hasil_warna | /health")
+    print(f"[MODE]  {'TESTING (3 menit)' if TESTING_MODE else 'PRODUKSI (3 hari)'}")
+    print(f"[FLASK] Endpoints: /upload_foto | /hasil_warna | /health | /status_pompa_nutrisi")
 
     # HTTP server khusus ESP32 di port 8081 (tanpa SSL)
     from wsgiref.simple_server import make_server
