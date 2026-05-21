@@ -670,14 +670,6 @@ if __name__ == "__main__":
     print(f"[MODE]  {'TESTING (3 menit)' if TESTING_MODE else 'PRODUKSI (3 hari)'}")
     print(f"[FLASK] Endpoints: /upload_foto | /hasil_warna | /health | /status_pompa_nutrisi")
 
-    # HTTP server khusus ESP32 di port 8081 (tanpa SSL)
-    from wsgiref.simple_server import make_server
-    def run_http():
-        srv = make_server('0.0.0.0', 8081, app)
-        print("[ESP32] HTTP server port 8081 ready")
-        srv.serve_forever()
-    threading.Thread(target=run_http, daemon=True).start()
-
     # Bot telegram di background thread
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
