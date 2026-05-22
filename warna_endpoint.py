@@ -1,5 +1,5 @@
 """
-warna_endpoint.py - FINAL VERSION + Pompa Nutrisi
+warna_endpoint.py - FINAL VERSION + Pompa Nutrisi + Bounding Box
 ====================================
 Flask endpoint + Bot Telegram dalam satu process.
 - Flask terima foto dari ESP32-CAM (POST /upload_foto)
@@ -7,6 +7,7 @@ Flask endpoint + Bot Telegram dalam satu process.
 - Hasil deteksi disimpan ke hasil_warna.json DAN MySQL
 - Setiap foto diupload ke Google Drive (folder per tanggal DD-MM-YYYY)
 - Logika pompa nutrisi: terjadwal + darurat
+- Bounding box koordinat normalized disimpan ke hasil_warna.json
 """
 
 import os
@@ -28,15 +29,13 @@ app = Flask(__name__)
 #  KONFIGURASI POMPA NUTRISI
 # =============================================
 
-# Ganti TESTING_MODE = False dan pakai INTERVAL_PRODUKSI untuk produksi
 TESTING_MODE = True
 
 INTERVAL_POMPA_DETIK = 3 * 60          # 3 menit (testing)
 # INTERVAL_POMPA_DETIK = 3 * 24 * 3600  # 3 hari (produksi)
 
-V_MEDIA_LITER = 45.0  # Volume kolam dalam liter
+V_MEDIA_LITER = 45.0
 
-# Konstanta K nutrisi per fase (mL/L)
 KONSTANTA_NUTRISI = {
     "Fase 1: Pembibitan" : 0.2,
     "Fase 2: Pertumbuhan": 0.4,
@@ -44,7 +43,6 @@ KONSTANTA_NUTRISI = {
     "Fase 4: Panen"      : 0.1,
 }
 
-# Urutan fase untuk deteksi mundur
 URUTAN_FASE = [
     "Fase 1: Pembibitan",
     "Fase 2: Pertumbuhan",
@@ -60,7 +58,6 @@ PH_NORMAL_MAX = 9.0
 # =============================================
 
 def get_db():
-    """Buat koneksi MySQL dari environment variable Railway."""
     return pymysql.connect(
         host     = os.environ.get("MYSQLHOST",     "localhost"),
         port     = int(os.environ.get("MYSQLPORT", "3306")),
@@ -77,7 +74,6 @@ def get_db():
 # =============================================
 
 def get_ph_terbaru():
-    """Ambil nilai pH terbaru dari database."""
     try:
         db = get_db()
         with db.cursor() as cur:
@@ -97,7 +93,6 @@ def get_ph_terbaru():
 
 
 def get_waktu_pompa_terakhir():
-    """Ambil waktu terakhir pompa nutrisi aktif dari database."""
     try:
         db = get_db()
         with db.cursor() as cur:
@@ -109,7 +104,7 @@ def get_waktu_pompa_terakhir():
             row = cur.fetchone()
         db.close()
         if row and row["waktu"]:
-            return row["waktu"]  # datetime object
+            return row["waktu"]
         return None
     except Exception as e:
         print(f"[DB] Gagal ambil waktu pompa terakhir: {e}")
@@ -117,7 +112,6 @@ def get_waktu_pompa_terakhir():
 
 
 def get_fase_sebelumnya():
-    """Ambil fase sebelumnya dari record terbaru di database."""
     try:
         db = get_db()
         with db.cursor() as cur:
@@ -137,68 +131,47 @@ def get_fase_sebelumnya():
 
 
 def hitung_volume_nutrisi(fase_label):
-    """Hitung volume nutrisi berdasarkan fase saat ini."""
     k = KONSTANTA_NUTRISI.get(fase_label, 0.0)
     return round(k * V_MEDIA_LITER, 2)
 
 
 def cek_fase_mundur(fase_sekarang, fase_sebelumnya):
-    """
-    Return True kalau fase sekarang lebih rendah dari fase sebelumnya.
-    Contoh: Fase 3 → Fase 2 = mundur
-    """
     if not fase_sekarang or not fase_sebelumnya:
         return False
     if fase_sekarang not in URUTAN_FASE or fase_sebelumnya not in URUTAN_FASE:
         return False
-    idx_sekarang   = URUTAN_FASE.index(fase_sekarang)
-    idx_sebelumnya = URUTAN_FASE.index(fase_sebelumnya)
-    return idx_sekarang < idx_sebelumnya
+    return URUTAN_FASE.index(fase_sekarang) < URUTAN_FASE.index(fase_sebelumnya)
 
 
 def cek_pompa_nutrisi(fase_sekarang):
-    """
-    Putuskan apakah pompa nutrisi harus ON.
-    Return: (harus_on: bool, alasan: str, volume_ml: float)
-    """
     if not fase_sekarang or fase_sekarang == "tidak terdeteksi":
         return False, "fase tidak terdeteksi", 0.0
 
     volume = hitung_volume_nutrisi(fase_sekarang)
     ph     = get_ph_terbaru()
 
-    # Cek fase mundur
     fase_sebelumnya_db, _ = get_fase_sebelumnya()
     fase_mundur = cek_fase_mundur(fase_sekarang, fase_sebelumnya_db)
 
-    # Cek pH darurat
     ph_darurat = False
     if ph is not None:
         ph_darurat = (ph < PH_NORMAL_MIN or ph > PH_NORMAL_MAX)
 
-    # Cek timer — sudah lewat interval sejak pompa terakhir?
     waktu_terakhir = get_waktu_pompa_terakhir()
     sudah_waktunya = False
     if waktu_terakhir is None:
-        # Belum pernah pompa sama sekali → langsung aktif
         sudah_waktunya = True
     else:
         selisih = (datetime.now() - waktu_terakhir).total_seconds()
         sudah_waktunya = selisih >= INTERVAL_POMPA_DETIK
 
-    # ── Logika keputusan ──────────────────────────────────────
-    # Darurat: langsung ON tanpa tunggu timer
     if fase_mundur and ph_darurat:
         return True, f"DARURAT: fase mundur ({fase_sebelumnya_db}→{fase_sekarang}) + pH={ph}", volume
-
     if fase_mundur:
         return True, f"DARURAT: fase mundur ({fase_sebelumnya_db}→{fase_sekarang})", volume
-
     if ph_darurat:
         alasan_ph = f"pH rendah ({ph})" if ph < PH_NORMAL_MIN else f"pH tinggi ({ph})"
         return True, f"DARURAT: {alasan_ph}", volume
-
-    # Terjadwal: ON kalau sudah waktunya
     if sudah_waktunya:
         mode = "testing 3 menit" if TESTING_MODE else "produksi 3 hari"
         return True, f"TERJADWAL ({mode})", volume
@@ -207,9 +180,8 @@ def cek_pompa_nutrisi(fase_sekarang):
 
 
 def update_status_pompa_db(pompa_on: bool, volume_ml: float, alasan: str):
-    """Update status pompa_normal di tabel status_pompa."""
     try:
-        db  = get_db()
+        db = get_db()
         status = "ON" if pompa_on else "OFF"
         with db.cursor() as cur:
             cur.execute(
@@ -227,17 +199,9 @@ def update_status_pompa_db(pompa_on: bool, volume_ml: float, alasan: str):
 # =============================================
 
 def insert_sensor_db(label, status, skor, fase_sebelumnya_val):
-    """
-    INSERT hasil deteksi warna ke tabel mikroalga_sensor.
-    pompa_normal diisi berdasarkan hasil cek_pompa_nutrisi().
-    """
     try:
-        # Cek pompa dulu
         pompa_on, alasan, volume_ml = cek_pompa_nutrisi(label)
-
-        # Update status_pompa table
         update_status_pompa_db(pompa_on, volume_ml, alasan)
-
         pompa_normal_val = "ON" if pompa_on else "IDLE"
 
         db = get_db()
@@ -262,7 +226,7 @@ def insert_sensor_db(label, status, skor, fase_sebelumnya_val):
         print(f"[DB] INSERT warna OK | pompa_normal={pompa_normal_val} | {alasan}")
 
         if pompa_on:
-            print(f"[POMPA] 🟢 AKTIF | Alasan: {alasan} | Volume: {volume_ml} mL")
+            print(f"[POMPA] AKTIF | Alasan: {alasan} | Volume: {volume_ml} mL")
         return pompa_on, alasan, volume_ml
 
     except Exception as e:
@@ -281,6 +245,7 @@ _hasil_warna = {
     "device_id"    : "-",
     "timestamp"    : None,
     "menit_lalu"   : None,
+    "bbox"         : None,
 }
 
 # =============================================
@@ -318,9 +283,9 @@ PROFIL_FALLBACK = {
     },
 }
 
-BOBOT_HSV = 0.55
+BOBOT_HSV  = 0.55
 BOBOT_HIST = 0.45
-SKOR_MIN  = 0.35
+SKOR_MIN   = 0.35
 
 # =============================================
 #  GOOGLE DRIVE CONFIG
@@ -468,11 +433,45 @@ def skor_histogram(frame_hsv, mask_kaca, hist_h_ref, hist_s_ref):
     return ((1 - dist_h) + (1 - dist_s)) / 2.0
 
 
+def hitung_bbox(frame_hsv, mask_kaca, lower, upper):
+    """
+    Cari bounding box kontur terbesar dari mask warna fase terbaik.
+    Return dict normalized 0.0-1.0 relatif ke ukuran frame, atau None.
+    """
+    mask_fase = cv2.inRange(frame_hsv,
+                            np.array(lower, dtype=np.uint8),
+                            np.array(upper, dtype=np.uint8))
+    mask_fase = cv2.bitwise_and(mask_fase, mask_kaca)
+
+    kernel = np.ones((7, 7), np.uint8)
+    mask_fase = cv2.morphologyEx(mask_fase, cv2.MORPH_OPEN,   kernel)
+    mask_fase = cv2.morphologyEx(mask_fase, cv2.MORPH_DILATE, kernel)
+
+    contours, _ = cv2.findContours(mask_fase, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    largest = max(contours, key=cv2.contourArea)
+    area    = cv2.contourArea(largest)
+
+    h_frame, w_frame = frame_hsv.shape[:2]
+    if area < (w_frame * h_frame * 0.01):
+        return None
+
+    x, y, w, h = cv2.boundingRect(largest)
+    return {
+        "x": round(x / w_frame, 4),
+        "y": round(y / h_frame, 4),
+        "w": round(w / w_frame, 4),
+        "h": round(h / h_frame, 4),
+    }
+
+
 def deteksi_warna(jpeg_bytes: bytes):
     img_array = np.frombuffer(jpeg_bytes, dtype=np.uint8)
     frame     = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
     if frame is None:
-        return "tidak terdeteksi", "-", 0.0
+        return "tidak terdeteksi", "-", 0.0, None
 
     hsv       = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask_kaca = buat_mask_kaca(hsv)
@@ -484,12 +483,12 @@ def deteksi_warna(jpeg_bytes: bytes):
                                 profil.get("hist_h", []),
                                 profil.get("hist_s", []))
         skor   = BOBOT_HSV * s_hsv + BOBOT_HIST * s_hist
-        hasil.append((skor, profil["label"]))
+        hasil.append((skor, profil["label"], fase_key))
 
     hasil.sort(reverse=True)
 
     if hasil and hasil[0][0] >= SKOR_MIN:
-        skor_terbaik, label = hasil[0]
+        skor_terbaik, label, fase_key_terbaik = hasil[0]
         STATUS_MAP = {
             "Fase 1: Pembibitan" : "pembibitan",
             "Fase 2: Pertumbuhan": "pertumbuhan",
@@ -497,9 +496,15 @@ def deteksi_warna(jpeg_bytes: bytes):
             "Fase 4: Panen"      : "siap panen",
         }
         status = STATUS_MAP.get(label, "-")
-        return label, status, round(skor_terbaik, 3)
 
-    return "tidak terdeteksi", "-", 0.0
+        profil_terbaik = profil_data[fase_key_terbaik]
+        bbox = hitung_bbox(hsv, mask_kaca,
+                           profil_terbaik["lower"],
+                           profil_terbaik["upper"])
+
+        return label, status, round(skor_terbaik, 3), bbox
+
+    return "tidak terdeteksi", "-", 0.0, None
 
 # =============================================
 #  SIMPAN / BACA HASIL
@@ -535,13 +540,12 @@ def upload_foto():
 
         print(f"[UPLOAD] {device_id} — {len(jpeg_bytes)} bytes")
 
-        label, status, skor = deteksi_warna(jpeg_bytes)
+        # Deteksi warna + bbox sekaligus
+        label, status, skor, bbox = deteksi_warna(jpeg_bytes)
 
         timestamp_now = datetime.now().isoformat()
 
-        # Ambil fase sebelumnya SEBELUM INSERT (untuk tracking mundur)
         fase_sebelumnya_lama, fase_db_terakhir = get_fase_sebelumnya()
-        # fase_sebelumnya yang disimpan = fase yang terdeteksi sebelum ini
         fase_untuk_disimpan = fase_db_terakhir if fase_db_terakhir else None
 
         hasil = {
@@ -550,26 +554,24 @@ def upload_foto():
             "skor"        : skor,
             "device_id"   : device_id,
             "timestamp"   : timestamp_now,
+            "bbox"        : bbox,   # normalized 0.0-1.0, atau null
         }
         simpan_hasil(hasil)
 
         with _lock:
             _hasil_warna.update(hasil)
 
-        print(f"[DETEKSI] {label} | {status} | skor={skor}")
+        print(f"[DETEKSI] {label} | {status} | skor={skor} | bbox={bbox}")
 
-        # INSERT ke database + cek pompa nutrisi
         pompa_on, alasan, volume_ml = insert_sensor_db(
             label, status, skor, fase_untuk_disimpan
         )
 
-        # Update hasil_warna.json dengan info pompa
         hasil["pompa_nutrisi"] = "ON" if pompa_on else "OFF"
         hasil["pompa_alasan"]  = alasan
         hasil["volume_ml"]     = volume_ml
         simpan_hasil(hasil)
 
-        # Upload ke Google Drive — non-blocking
         threading.Thread(
             target=upload_ke_gdrive,
             args=(jpeg_bytes, device_id, timestamp_now),
@@ -581,6 +583,7 @@ def upload_foto():
             "warna"        : label,
             "status_warna" : status,
             "skor"         : skor,
+            "bbox"         : bbox,
             "pompa_nutrisi": "ON" if pompa_on else "OFF",
             "volume_ml"    : volume_ml,
             "alasan"       : alasan,
@@ -593,16 +596,10 @@ def upload_foto():
 
 @app.route("/status_pompa_nutrisi", methods=["GET"])
 def status_pompa_nutrisi():
-    """
-    Endpoint untuk ESP32 — GET status pompa nutrisi saat ini.
-    ESP32 panggil ini setiap loop, lalu aktifkan RELAY_NUTRISI sesuai hasilnya.
-    """
     try:
         data = baca_hasil()
         fase = data.get("warna", "tidak terdeteksi")
-
         pompa_on, alasan, volume_ml = cek_pompa_nutrisi(fase)
-
         return jsonify({
             "pompa_nutrisi": "ON" if pompa_on else "OFF",
             "volume_ml"    : volume_ml,
@@ -631,9 +628,9 @@ def hasil_warna():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
-        "status"       : "ok",
-        "timestamp"    : datetime.now().isoformat(),
-        "testing_mode" : TESTING_MODE,
+        "status"        : "ok",
+        "timestamp"     : datetime.now().isoformat(),
+        "testing_mode"  : TESTING_MODE,
         "interval_detik": INTERVAL_POMPA_DETIK,
     })
 
@@ -664,13 +661,12 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
 
     print("=" * 50)
-    print("Warna Endpoint + Bot Telegram + Pompa Nutrisi")
+    print("Warna Endpoint + Bot Telegram + Pompa Nutrisi + BBox")
     print("=" * 50)
     print(f"[FLASK] Port: {port}")
     print(f"[MODE]  {'TESTING (3 menit)' if TESTING_MODE else 'PRODUKSI (3 hari)'}")
     print(f"[FLASK] Endpoints: /upload_foto | /hasil_warna | /health | /status_pompa_nutrisi")
 
-    # Bot telegram di background thread
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
     print("[BOT] Thread dimulai")
