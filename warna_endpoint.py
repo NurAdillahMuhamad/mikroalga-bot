@@ -216,24 +216,12 @@ def update_status_pompa_db(pompa_on: bool):
 # UPDATE SENSOR DB (FIX: UPDATE bukan INSERT)
 # =============================================
 def update_sensor_db(label, status, skor, fase_sebelumnya_val):
-    """
-    FIX UTAMA:
-    - Sebelumnya: INSERT row baru → pH & warna tidak pernah di row yg sama
-    - Sekarang:   UPDATE row terakhir → data lengkap dalam 1 row
-    
-    Kolom yang diupdate:
-    - warna, status_warna          (hasil deteksi)
-    - fase_sebelumnya              (fase sebelum deteksi ini)
-    - pompa_nutrisi, vol_nutrisi   (hasil cek pompa)
-    """
     try:
-        # Ambil fase sebelumnya dari DB sebelum update
         pompa_on, alasan, volume_ml = cek_pompa_nutrisi(label, fase_sebelumnya_val)
         update_status_pompa_db(pompa_on)
 
         pompa_nutrisi_val = "ON" if pompa_on else "OFF"
 
-        # Ambil id row terakhir untuk di-UPDATE
         max_id = get_id_sensor_terakhir()
         if not max_id:
             print("[DB] Tidak ada row untuk di-UPDATE, skip.")
@@ -241,6 +229,22 @@ def update_sensor_db(label, status, skor, fase_sebelumnya_val):
 
         db = get_db()
         with db.cursor() as cur:
+
+            # ── TAHAP 1: Update semua row kosong dengan warna saja ──
+            cur.execute(
+                """
+                UPDATE mikroalga_sensor
+                SET
+                    warna        = %s,
+                    status_warna = %s,
+                    pompa_nutrisi = 'OFF'
+                WHERE (warna = 'tidak terdeteksi' OR warna IS NULL)
+                AND id <= %s
+                """,
+                (label, status, max_id)
+            )
+
+            # ── TAHAP 2: Update row terakhir lengkap dengan pompa ──
             cur.execute(
                 """
                 UPDATE mikroalga_sensor
@@ -261,10 +265,12 @@ def update_sensor_db(label, status, skor, fase_sebelumnya_val):
                     max_id,
                 )
             )
+
         db.commit()
         db.close()
 
-        print(f"[DB] UPDATE id={max_id} | warna={label} | pompa_nutrisi={pompa_nutrisi_val} | vol={volume_ml}mL | alasan={alasan}")
+        print(f"[DB] UPDATE semua row kosong → warna={label}")
+        print(f"[DB] UPDATE id={max_id} | pompa_nutrisi={pompa_nutrisi_val} | vol={volume_ml}mL | alasan={alasan}")
         return pompa_on, alasan, volume_ml
 
     except Exception as e:
