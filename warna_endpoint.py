@@ -1,16 +1,14 @@
 """
-warna_endpoint.py - REVISED VERSION
-====================================
+warna_endpoint.py
+=================
 Perubahan dari versi sebelumnya:
-1. insert_sensor_db() → UPDATE row terakhir (bukan INSERT baru)
-2. Fix kolom pompa_normal → pompa_nutrisi
-3. Fix PH_NORMAL_MAX 9.0 → 10.5
-4. Tambah vol_nutrisi ke UPDATE DB
-5. Fix get_waktu_pompa_terakhir() cek kolom pompa_nutrisi
-6. Fix fase_sebelumnya logic
-7. Fix fallback baca DB kalau hasil_warna.json hilang
-8. Hapus persentase_warna dari semua query
-9. Koneksi DB pakai environment variable Railway
+1. Logika pompa nutrisi dipisah jadi 2:
+   - Logika 1 (Darurat): pH abnormal DAN fase mundur → pompa nyala, delay 3 jam, cek lagi
+   - Logika 2 (Terjadwal): 3 hari stabil → pompa nyala, reset timer
+2. Fix rumus volume: hapus ×1000 (satuan langsung mL)
+3. Durasi pompa dihitung dari volume (bukan waktu tetap)
+4. Semua timestamp disimpan di DB agar tahan Railway restart
+5. Timer 3 hari direset jika kondisi darurat muncul di tengah periode
 """
 
 import os
@@ -29,11 +27,21 @@ from datetime import datetime, timedelta
 app = Flask(__name__)
 
 # =============================================
-# KONFIGURASI POMPA NUTRISI
+# KONFIGURASI
 # =============================================
-TESTING_MODE         = False
-INTERVAL_POMPA_DETIK = 3 * 24 * 3600          
-# INTERVAL_POMPA_DETIK = 3 * 24 * 3600 # 3 hari (produksi)
+TESTING_MODE = False
+
+# Logika 2: interval terjadwal
+INTERVAL_TERJADWAL_DETIK = 3 * 24 * 3600   # 3 hari produksi
+# INTERVAL_TERJADWAL_DETIK = 3 * 60         # 3 menit testing
+
+# Logika 1: delay antar cek saat kondisi darurat
+DELAY_DARURAT_DETIK = 3 * 3600              # 3 jam produksi
+# DELAY_DARURAT_DETIK = 3 * 60             # 3 menit testing
+
+# Durasi pompa dihitung dari volume
+# Pompa mengalirkan 100 mL per menit
+Q_ML_PER_MENIT = 100.0
 
 V_MEDIA_LITER = 45.0
 
@@ -51,22 +59,21 @@ URUTAN_FASE = [
     "Fase 4: Panen",
 ]
 
-# ── FIX: threshold pH sesuai spesifikasi sistem ─────────────────
 PH_NORMAL_MIN = 8.5
-PH_NORMAL_MAX = 10.5   # sebelumnya 9.0 → SALAH
+PH_NORMAL_MAX = 10.5
 
 # =============================================
-# KONEKSI DATABASE (env variable Railway)
+# KONEKSI DATABASE
 # =============================================
 def get_db():
     return pymysql.connect(
-        host    = os.environ.get("MYSQLHOST",     "localhost"),
-        port    = int(os.environ.get("MYSQLPORT", "3306")),
-        user    = os.environ.get("MYSQLUSER",     "root"),
-        password= os.environ.get("MYSQLPASSWORD", ""),
-        database= os.environ.get("MYSQLDATABASE", "railway"),
-        charset = "utf8mb4",
-        cursorclass = pymysql.cursors.DictCursor,
+        host     = os.environ.get("MYSQLHOST",     "localhost"),
+        port     = int(os.environ.get("MYSQLPORT", "3306")),
+        user     = os.environ.get("MYSQLUSER",     "root"),
+        password = os.environ.get("MYSQLPASSWORD", ""),
+        database = os.environ.get("MYSQLDATABASE", "railway"),
+        charset  = "utf8mb4",
+        cursorclass     = pymysql.cursors.DictCursor,
         connect_timeout = 10,
     )
 
@@ -89,31 +96,8 @@ def get_ph_terbaru():
         print(f"[DB] Gagal ambil pH: {e}")
         return None
 
-def get_waktu_pompa_nutrisi_terakhir():
-    """
-    FIX: sebelumnya cek pompa_normal = 'ON' (salah kolom).
-    Sekarang cek pompa_nutrisi = 'ON' (benar).
-    """
-    try:
-        db = get_db()
-        with db.cursor() as cur:
-            cur.execute(
-                "SELECT waktu FROM mikroalga_sensor "
-                "WHERE pompa_nutrisi = 'ON' "
-                "ORDER BY id DESC LIMIT 1"
-            )
-            row = cur.fetchone()
-        db.close()
-        return row["waktu"] if row and row["waktu"] else None
-    except Exception as e:
-        print(f"[DB] Gagal ambil waktu pompa nutrisi terakhir: {e}")
-        return None
-
 def get_fase_db_terakhir():
-    """
-    Ambil fase warna terakhir yang terdeteksi dari DB.
-    Dipakai sebagai fase_sebelumnya untuk deteksi berikutnya.
-    """
+    """Ambil fase warna terakhir yang terdeteksi dari DB."""
     try:
         db = get_db()
         with db.cursor() as cur:
@@ -132,10 +116,7 @@ def get_fase_db_terakhir():
         return None
 
 def get_id_sensor_terakhir():
-    """
-    Ambil id row terakhir dari mikroalga_sensor.
-    Dipakai untuk UPDATE (bukan INSERT baru).
-    """
+    """Ambil id row terakhir dari mikroalga_sensor."""
     try:
         db = get_db()
         with db.cursor() as cur:
@@ -147,12 +128,110 @@ def get_id_sensor_terakhir():
         print(f"[DB] Gagal ambil id terakhir: {e}")
         return None
 
+def get_waktu_pompa_nutrisi_terakhir():
+    """
+    Ambil waktu terakhir pompa nutrisi nyala dari DB.
+    Dipakai untuk hitung interval 3 hari (Logika 2)
+    dan delay 3 jam (Logika 1).
+    """
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT waktu FROM mikroalga_sensor "
+                "WHERE pompa_nutrisi = 'ON' "
+                "ORDER BY id DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+        db.close()
+        return row["waktu"] if row and row["waktu"] else None
+    except Exception as e:
+        print(f"[DB] Gagal ambil waktu pompa nutrisi terakhir: {e}")
+        return None
+
+def cek_stabilitas_3_hari():
+    """
+    Logika 2 — cek apakah selama 3 hari terakhir:
+    1. pH selalu dalam rentang normal (8.5–10.5)
+    2. Fase tidak pernah mundur
+
+    Return: (stabil: bool, alasan: str)
+    """
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            # Cek pH abnormal dalam 3 hari terakhir
+            cur.execute(
+                """
+                SELECT COUNT(*) as total,
+                    SUM(CASE WHEN pH < %s OR pH > %s THEN 1 ELSE 0 END) as ph_abnormal
+                FROM mikroalga_sensor
+                WHERE waktu >= NOW() - INTERVAL 3 DAY
+                AND pH IS NOT NULL
+                """,
+                (PH_NORMAL_MIN, PH_NORMAL_MAX)
+            )
+            row_ph = cur.fetchone()
+
+            # Cek fase mundur dalam 3 hari terakhir
+            # fase_sebelumnya lebih tinggi dari warna sekarang = mundur
+            cur.execute(
+                """
+                SELECT COUNT(*) as fase_mundur
+                FROM mikroalga_sensor
+                WHERE waktu >= NOW() - INTERVAL 3 DAY
+                AND warna IS NOT NULL
+                AND warna != 'tidak terdeteksi'
+                AND fase_sebelumnya IS NOT NULL
+                AND fase_sebelumnya != ''
+                AND (
+                    FIELD(warna, %s, %s, %s, %s) <
+                    FIELD(fase_sebelumnya, %s, %s, %s, %s)
+                )
+                """,
+                (
+                    *URUTAN_FASE,   # untuk warna
+                    *URUTAN_FASE,   # untuk fase_sebelumnya
+                )
+            )
+            row_fase = cur.fetchone()
+        db.close()
+
+        total        = row_ph["total"] if row_ph else 0
+        ph_abnormal  = row_ph["ph_abnormal"] if row_ph else 0
+        fase_mundur  = row_fase["fase_mundur"] if row_fase else 0
+
+        if total == 0:
+            return False, "belum ada data 3 hari"
+        if ph_abnormal and ph_abnormal > 0:
+            return False, f"pH abnormal {ph_abnormal}x dalam 3 hari"
+        if fase_mundur and fase_mundur > 0:
+            return False, f"fase mundur {fase_mundur}x dalam 3 hari"
+
+        return True, "kondisi stabil 3 hari"
+
+    except Exception as e:
+        print(f"[DB] Gagal cek stabilitas: {e}")
+        return False, f"db error: {e}"
+
 # =============================================
 # LOGIKA POMPA NUTRISI
 # =============================================
 def hitung_volume_nutrisi(fase_label):
+    """
+    FIX: hapus ×1000, satuan langsung mL.
+    Contoh Fase 1: 0.2 × 45 = 9 mL
+    """
     k = KONSTANTA_NUTRISI.get(fase_label, 0.0)
-    return round(k * V_MEDIA_LITER * 1000, 2)   # hasil dalam mL
+    return round(k * V_MEDIA_LITER, 2)
+
+def hitung_durasi_detik(volume_ml):
+    """
+    Hitung durasi pompa dari volume.
+    Pompa = 100 mL/menit.
+    Contoh: 9 mL / 100 mL/menit × 60 detik = 5.4 detik
+    """
+    return round((volume_ml / Q_ML_PER_MENIT) * 60, 1)
 
 def cek_fase_mundur(fase_sekarang, fase_sebelumnya):
     if not fase_sekarang or not fase_sebelumnya:
@@ -162,133 +241,212 @@ def cek_fase_mundur(fase_sekarang, fase_sebelumnya):
     return URUTAN_FASE.index(fase_sekarang) < URUTAN_FASE.index(fase_sebelumnya)
 
 def cek_pompa_nutrisi(fase_sekarang, fase_sebelumnya_val):
+    """
+    Dua logika pemberian nutrisi:
+
+    LOGIKA 1 — DARURAT:
+    Syarat: pH abnormal DAN fase mundur (keduanya harus terpenuhi)
+    Setelah pompa nyala → delay 3 jam → cek lagi
+    Jika masih darurat → pompa nyala lagi
+    Jika sudah stabil → masuk Logika 2, reset timer 3 hari
+
+    LOGIKA 2 — TERJADWAL:
+    Syarat: sudah 3 hari sejak pemberian terakhir
+            DAN selama 3 hari pH selalu normal
+            DAN fase tidak pernah mundur
+    Jika di tengah periode Logika 2 kondisi darurat muncul
+    → langsung masuk Logika 1, timer 3 hari direset
+
+    Return: (pompa_on: bool, alasan: str, volume_ml: float, durasi_detik: float)
+    """
     if not fase_sekarang or fase_sekarang == "tidak terdeteksi":
-        return False, "fase tidak terdeteksi", 0.0
+        return False, "fase tidak terdeteksi", 0.0, 0.0
 
-    volume = hitung_volume_nutrisi(fase_sekarang)
-    ph     = get_ph_terbaru()
-
+    volume     = hitung_volume_nutrisi(fase_sekarang)
+    durasi     = hitung_durasi_detik(volume)
+    ph         = get_ph_terbaru()
     fase_mundur = cek_fase_mundur(fase_sekarang, fase_sebelumnya_val)
 
-    ph_darurat = False
+    # Cek kondisi darurat (keduanya harus tidak normal)
+    ph_abnormal = False
     if ph is not None:
-        ph_darurat = (ph < PH_NORMAL_MIN or ph > PH_NORMAL_MAX)
+        ph_abnormal = (ph < PH_NORMAL_MIN or ph > PH_NORMAL_MAX)
 
-    waktu_terakhir  = get_waktu_pompa_nutrisi_terakhir()
-    sudah_waktunya  = False
-    if waktu_terakhir is None:
-        sudah_waktunya = True
+    kondisi_darurat = ph_abnormal and fase_mundur
+
+    # Ambil waktu terakhir pompa nyala dari DB
+    waktu_terakhir = get_waktu_pompa_nutrisi_terakhir()
+    now            = datetime.now()
+
+    if kondisi_darurat:
+        # ── LOGIKA 1: DARURAT ────────────────────────────────────
+        # Cek apakah delay 3 jam sudah lewat sejak darurat terakhir
+        if waktu_terakhir is None:
+            # Belum pernah nyala → langsung nyala
+            alasan = f"DARURAT: pH={ph} + fase mundur ({fase_sebelumnya_val}→{fase_sekarang})"
+            print(f"[POMPA] {alasan}")
+            return True, alasan, volume, durasi
+
+        selisih = (now - waktu_terakhir).total_seconds()
+        if selisih >= DELAY_DARURAT_DETIK:
+            # Delay 3 jam sudah lewat → pompa nyala lagi
+            alasan = (
+                f"DARURAT: pH={ph} + fase mundur ({fase_sebelumnya_val}→{fase_sekarang}) "
+                f"| {int(selisih/3600)} jam sejak terakhir"
+            )
+            print(f"[POMPA] {alasan}")
+            return True, alasan, volume, durasi
+        else:
+            # Masih dalam delay 3 jam
+            sisa = int((DELAY_DARURAT_DETIK - selisih) / 60)
+            alasan = f"DARURAT menunggu: sisa {sisa} menit delay 3 jam"
+            print(f"[POMPA] {alasan}")
+            return False, alasan, 0.0, 0.0
+
     else:
-        selisih = (datetime.now() - waktu_terakhir).total_seconds()
-        sudah_waktunya = selisih >= INTERVAL_POMPA_DETIK
+        # ── LOGIKA 2: TERJADWAL ──────────────────────────────────
+        # Syarat 1: sudah 3 hari sejak pemberian terakhir
+        if waktu_terakhir is None:
+            sudah_3_hari = True
+        else:
+            selisih      = (now - waktu_terakhir).total_seconds()
+            sudah_3_hari = selisih >= INTERVAL_TERJADWAL_DETIK
 
-    # Prioritas kondisi
-    if fase_mundur and ph_darurat:
-        return True, f"DARURAT: fase mundur ({fase_sebelumnya_val}→{fase_sekarang}) + pH={ph}", volume
-    if fase_mundur:
-        return True, f"DARURAT: fase mundur ({fase_sebelumnya_val}→{fase_sekarang})", volume
-    if ph_darurat:
-        alasan_ph = f"pH rendah ({ph})" if ph < PH_NORMAL_MIN else f"pH tinggi ({ph})"
-        return True, f"DARURAT: {alasan_ph}", volume
-    if sudah_waktunya:
-        mode = "testing 3 menit" if TESTING_MODE else "produksi 3 hari"
-        return True, f"TERJADWAL ({mode})", volume
+        if not sudah_3_hari:
+            sisa_jam = int((INTERVAL_TERJADWAL_DETIK - selisih) / 3600)
+            return False, f"terjadwal: sisa {sisa_jam} jam", 0.0, 0.0
 
-    return False, "belum waktunya", 0.0
+        # Syarat 2: cek stabilitas 3 hari via query DB
+        stabil, alasan_stabil = cek_stabilitas_3_hari()
+        if not stabil:
+            return False, f"terjadwal: {alasan_stabil}", 0.0, 0.0
 
-def update_status_pompa_db(pompa_on: bool):
+        alasan = f"TERJADWAL 3 hari | {alasan_stabil}"
+        print(f"[POMPA] {alasan}")
+        return True, alasan, volume, durasi
+
+def update_status_pompa_db(pompa_on: bool, volume_ml: float = 0.0, durasi_detik: float = 0.0):
     """Update tabel status_pompa untuk pompa_nutrisi."""
     try:
         db  = get_db()
         val = "ON" if pompa_on else "OFF"
         with db.cursor() as cur:
-            cur.execute(
-                "UPDATE status_pompa SET pompa_nutrisi = %s WHERE id = 1",
-                (val,)
-            )
+            # Cek apakah kolom vol_nutrisi ada di status_pompa
+            # Jika belum ada, update tanpa kolom itu
+            try:
+                cur.execute(
+                    """
+                    UPDATE status_pompa
+                    SET pompa_nutrisi = %s,
+                        vol_nutrisi   = %s
+                    WHERE id = 1
+                    """,
+                    (val, volume_ml)
+                )
+            except Exception:
+                # Fallback jika kolom vol_nutrisi belum ada
+                cur.execute(
+                    "UPDATE status_pompa SET pompa_nutrisi = %s WHERE id = 1",
+                    (val,)
+                )
         db.commit()
         db.close()
-        print(f"[POMPA] status_pompa.pompa_nutrisi = {val}")
+        print(f"[POMPA] status_pompa.pompa_nutrisi = {val} | vol = {volume_ml} mL | durasi = {durasi_detik}s")
     except Exception as e:
         print(f"[DB] Gagal update status_pompa: {e}")
 
 # =============================================
-# UPDATE SENSOR DB (FIX: UPDATE bukan INSERT)
+# UPDATE SENSOR DB
 # =============================================
 def update_sensor_db(label, status, skor, fase_sebelumnya_val):
+    """
+    UPDATE row terakhir di mikroalga_sensor dengan:
+    - warna, status_warna (hasil deteksi)
+    - pompa_nutrisi, vol_nutrisi (hasil keputusan pompa)
+    - fase_sebelumnya
+    - durasi_nutrisi_detik (berapa lama pompa harus nyala)
+    """
     try:
-        pompa_on, alasan, volume_ml = cek_pompa_nutrisi(label, fase_sebelumnya_val)
-        update_status_pompa_db(pompa_on)
+        pompa_on, alasan, volume_ml, durasi_detik = cek_pompa_nutrisi(label, fase_sebelumnya_val)
+        update_status_pompa_db(pompa_on, volume_ml, durasi_detik)
 
         pompa_nutrisi_val = "ON" if pompa_on else "OFF"
 
         max_id = get_id_sensor_terakhir()
         if not max_id:
             print("[DB] Tidak ada row untuk di-UPDATE, skip.")
-            return False, "tidak ada row", 0.0
+            return False, "tidak ada row", 0.0, 0.0
 
         db = get_db()
         with db.cursor() as cur:
-
-            # ── TAHAP 1: Update semua row kosong dengan warna saja ──
-            cur.execute(
-                """
-                UPDATE mikroalga_sensor
-                SET
-                    warna        = %s,
-                    status_warna = %s,
-                    pompa_nutrisi = 'OFF'
-                WHERE (warna = 'tidak terdeteksi' OR warna IS NULL)
-                AND id <= %s
-                """,
-                (label, status, max_id)
-            )
-
-            # ── TAHAP 2: Update row terakhir lengkap dengan pompa ──
-            cur.execute(
-                """
-                UPDATE mikroalga_sensor
-                SET
-                    warna           = %s,
-                    status_warna    = %s,
-                    pompa_nutrisi   = %s,
-                    vol_nutrisi     = %s,
-                    fase_sebelumnya = %s
-                WHERE id = %s
-                """,
-                (
-                    label,
-                    status,
-                    pompa_nutrisi_val,
-                    volume_ml,
-                    fase_sebelumnya_val,
-                    max_id,
+            # Update row terakhir dengan semua data lengkap
+            try:
+                cur.execute(
+                    """
+                    UPDATE mikroalga_sensor
+                    SET
+                        warna                = %s,
+                        status_warna         = %s,
+                        pompa_nutrisi        = %s,
+                        vol_nutrisi          = %s,
+                        durasi_nutrisi_detik = %s,
+                        fase_sebelumnya      = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        label,
+                        status,
+                        pompa_nutrisi_val,
+                        volume_ml,
+                        durasi_detik,
+                        fase_sebelumnya_val,
+                        max_id,
+                    )
                 )
-            )
-
+            except Exception:
+                # Fallback jika kolom durasi_nutrisi_detik belum ada
+                cur.execute(
+                    """
+                    UPDATE mikroalga_sensor
+                    SET
+                        warna           = %s,
+                        status_warna    = %s,
+                        pompa_nutrisi   = %s,
+                        vol_nutrisi     = %s,
+                        fase_sebelumnya = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        label,
+                        status,
+                        pompa_nutrisi_val,
+                        volume_ml,
+                        fase_sebelumnya_val,
+                        max_id,
+                    )
+                )
         db.commit()
         db.close()
 
-        print(f"[DB] UPDATE semua row kosong → warna={label}")
-        print(f"[DB] UPDATE id={max_id} | pompa_nutrisi={pompa_nutrisi_val} | vol={volume_ml}mL | alasan={alasan}")
-        return pompa_on, alasan, volume_ml
+        print(f"[DB] UPDATE id={max_id} | warna={label} | pompa_nutrisi={pompa_nutrisi_val} | vol={volume_ml}mL | durasi={durasi_detik}s | alasan={alasan}")
+        return pompa_on, alasan, volume_ml, durasi_detik
 
     except Exception as e:
         print(f"[DB] Gagal UPDATE sensor: {e}")
-        return False, "db error", 0.0
+        return False, "db error", 0.0, 0.0
 
 # =============================================
 # STATE GLOBAL
 # =============================================
-_lock       = threading.Lock()
+_lock        = threading.Lock()
 _hasil_warna = {
-    "warna"       : "tidak terdeteksi",
-    "status_warna": "-",
-    "skor"        : 0.0,
-    "device_id"   : "-",
-    "timestamp"   : None,
-    "menit_lalu"  : None,
-    "bbox"        : None,
+    "warna"        : "tidak terdeteksi",
+    "status_warna" : "-",
+    "skor"         : 0.0,
+    "device_id"    : "-",
+    "timestamp"    : None,
+    "menit_lalu"   : None,
+    "bbox"         : None,
 }
 
 # =============================================
@@ -353,15 +511,19 @@ def _get_gdrive_service():
     return build("drive", "v3", credentials=creds)
 
 def _get_atau_buat_folder(service, nama_folder, parent_id):
-    query  = (f"name='{nama_folder}' and '{parent_id}' in parents "
-              f"and mimeType='application/vnd.google-apps.folder' and trashed=false")
-    hasil  = service.files().list(q=query, fields="files(id, name)").execute()
-    files  = hasil.get("files", [])
+    query = (
+        f"name='{nama_folder}' and '{parent_id}' in parents "
+        f"and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    )
+    hasil = service.files().list(q=query, fields="files(id, name)").execute()
+    files = hasil.get("files", [])
     if files:
         return files[0]["id"]
-    metadata = {"name": nama_folder,
-                "mimeType": "application/vnd.google-apps.folder",
-                "parents": [parent_id]}
+    metadata = {
+        "name"    : nama_folder,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents" : [parent_id],
+    }
     folder = service.files().create(body=metadata, fields="id").execute()
     return folder["id"]
 
@@ -419,9 +581,11 @@ def skor_hsv(frame_hsv, mask_kaca, lower, upper):
     total = cv2.countNonZero(mask_kaca)
     if total == 0:
         return 0.0
-    mask_hsv = cv2.inRange(frame_hsv,
-                           np.array(lower, dtype=np.uint8),
-                           np.array(upper, dtype=np.uint8))
+    mask_hsv = cv2.inRange(
+        frame_hsv,
+        np.array(lower, dtype=np.uint8),
+        np.array(upper, dtype=np.uint8)
+    )
     mask_hsv = cv2.bitwise_and(mask_hsv, mask_kaca)
     k        = np.ones((5, 5), np.uint8)
     mask_hsv = cv2.morphologyEx(mask_hsv, cv2.MORPH_OPEN,   k)
@@ -449,18 +613,20 @@ def skor_histogram(frame_hsv, mask_kaca, hist_h_ref, hist_s_ref):
     return ((1 - dist_h) + (1 - dist_s)) / 2.0
 
 def hitung_bbox(frame_hsv, mask_kaca, lower, upper):
-    mask_fase = cv2.inRange(frame_hsv,
-                            np.array(lower, dtype=np.uint8),
-                            np.array(upper, dtype=np.uint8))
-    mask_fase = cv2.bitwise_and(mask_fase, mask_kaca)
-    kernel    = np.ones((7, 7), np.uint8)
-    mask_fase = cv2.morphologyEx(mask_fase, cv2.MORPH_OPEN,   kernel)
-    mask_fase = cv2.morphologyEx(mask_fase, cv2.MORPH_DILATE, kernel)
+    mask_fase = cv2.inRange(
+        frame_hsv,
+        np.array(lower, dtype=np.uint8),
+        np.array(upper, dtype=np.uint8)
+    )
+    mask_fase   = cv2.bitwise_and(mask_fase, mask_kaca)
+    kernel      = np.ones((7, 7), np.uint8)
+    mask_fase   = cv2.morphologyEx(mask_fase, cv2.MORPH_OPEN,   kernel)
+    mask_fase   = cv2.morphologyEx(mask_fase, cv2.MORPH_DILATE, kernel)
     contours, _ = cv2.findContours(mask_fase, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
-    largest   = max(contours, key=cv2.contourArea)
-    area      = cv2.contourArea(largest)
+    largest          = max(contours, key=cv2.contourArea)
+    area             = cv2.contourArea(largest)
     h_frame, w_frame = frame_hsv.shape[:2]
     if area < (w_frame * h_frame * 0.01):
         return None
@@ -482,10 +648,12 @@ def deteksi_warna(jpeg_bytes: bytes):
     hasil     = []
     for fase_key, profil in profil_data.items():
         s_hsv  = skor_hsv(hsv, mask_kaca, profil["lower"], profil["upper"])
-        s_hist = skor_histogram(hsv, mask_kaca,
-                                profil.get("hist_h", []),
-                                profil.get("hist_s", []))
-        skor   = BOBOT_HSV * s_hsv + BOBOT_HIST * s_hist
+        s_hist = skor_histogram(
+            hsv, mask_kaca,
+            profil.get("hist_h", []),
+            profil.get("hist_s", [])
+        )
+        skor = BOBOT_HSV * s_hsv + BOBOT_HIST * s_hist
         hasil.append((skor, profil["label"], fase_key))
     hasil.sort(reverse=True)
     if hasil and hasil[0][0] >= SKOR_MIN:
@@ -496,11 +664,9 @@ def deteksi_warna(jpeg_bytes: bytes):
             "Fase 3: Optimal"    : "optimal",
             "Fase 4: Panen"      : "siap panen",
         }
-        status        = STATUS_MAP.get(label, "-")
+        status         = STATUS_MAP.get(label, "-")
         profil_terbaik = profil_data[fase_key_terbaik]
-        bbox          = hitung_bbox(hsv, mask_kaca,
-                                    profil_terbaik["lower"],
-                                    profil_terbaik["upper"])
+        bbox           = hitung_bbox(hsv, mask_kaca, profil_terbaik["lower"], profil_terbaik["upper"])
         return label, status, round(skor_terbaik, 3), bbox
     return "tidak terdeteksi", "-", 0.0, None
 
@@ -517,18 +683,13 @@ def simpan_hasil(data: dict):
         print(f"[JSON] Gagal simpan hasil_warna.json: {e}")
 
 def baca_hasil() -> dict:
-    """
-    FIX: fallback ke DB kalau file JSON tidak ada (Railway restart).
-    """
-    # Coba baca dari file lokal dulu
+    """Baca hasil deteksi, fallback ke DB jika file tidak ada."""
     if os.path.exists(HASIL_PATH):
         try:
             with open(HASIL_PATH, "r") as f:
                 return json.load(f)
         except Exception:
             pass
-
-    # Fallback: baca dari DB
     try:
         db = get_db()
         with db.cursor() as cur:
@@ -552,7 +713,6 @@ def baca_hasil() -> dict:
             }
     except Exception as e:
         print(f"[DB] Fallback baca hasil gagal: {e}")
-
     return _hasil_warna.copy()
 
 # =============================================
@@ -572,7 +732,7 @@ def upload_foto():
 
         print(f"[UPLOAD] {device_id} — {len(jpeg_bytes)} bytes")
 
-        # Ambil fase DB terakhir SEBELUM deteksi → ini akan jadi fase_sebelumnya
+        # Ambil fase DB terakhir SEBELUM deteksi → fase_sebelumnya
         fase_sebelumnya_val = get_fase_db_terakhir()
 
         # Deteksi warna + bbox
@@ -596,13 +756,14 @@ def upload_foto():
         print(f"[DETEKSI] {label} | {status} | skor={skor} | fase_sebelumnya={fase_sebelumnya_val}")
 
         # UPDATE row terakhir di DB
-        pompa_on, alasan, volume_ml = update_sensor_db(
+        pompa_on, alasan, volume_ml, durasi_detik = update_sensor_db(
             label, status, skor, fase_sebelumnya_val
         )
 
-        hasil["pompa_nutrisi"] = "ON" if pompa_on else "OFF"
-        hasil["pompa_alasan"]  = alasan
-        hasil["volume_ml"]     = volume_ml
+        hasil["pompa_nutrisi"]  = "ON" if pompa_on else "OFF"
+        hasil["pompa_alasan"]   = alasan
+        hasil["volume_ml"]      = volume_ml
+        hasil["durasi_detik"]   = durasi_detik
         simpan_hasil(hasil)
 
         # Upload foto ke Google Drive (background thread)
@@ -613,14 +774,15 @@ def upload_foto():
         ).start()
 
         return jsonify({
-            "ok"          : True,
-            "warna"       : label,
-            "status_warna": status,
-            "skor"        : skor,
-            "bbox"        : bbox,
+            "ok"           : True,
+            "warna"        : label,
+            "status_warna" : status,
+            "skor"         : skor,
+            "bbox"         : bbox,
             "pompa_nutrisi": "ON" if pompa_on else "OFF",
-            "volume_ml"   : volume_ml,
-            "alasan"      : alasan,
+            "volume_ml"    : volume_ml,
+            "durasi_detik" : durasi_detik,
+            "alasan"       : alasan,
         })
 
     except Exception as e:
@@ -630,14 +792,20 @@ def upload_foto():
 
 @app.route("/status_pompa_nutrisi", methods=["GET"])
 def status_pompa_nutrisi():
+    """
+    Endpoint yang dipoll ESP32 setiap 30 detik.
+    Mengembalikan status pompa nutrisi beserta volume dan durasi.
+    ESP32 pakai durasi_detik untuk hitung berapa lama relay nyala.
+    """
     try:
-        data      = baca_hasil()
-        fase      = data.get("warna", "tidak terdeteksi")
-        fase_sblm = get_fase_db_terakhir()
-        pompa_on, alasan, volume_ml = cek_pompa_nutrisi(fase, fase_sblm)
+        data       = baca_hasil()
+        fase       = data.get("warna", "tidak terdeteksi")
+        fase_sblm  = get_fase_db_terakhir()
+        pompa_on, alasan, volume_ml, durasi_detik = cek_pompa_nutrisi(fase, fase_sblm)
         return jsonify({
             "pompa_nutrisi": "ON" if pompa_on else "OFF",
             "volume_ml"    : volume_ml,
+            "durasi_detik" : durasi_detik,
             "alasan"       : alasan,
             "fase"         : fase,
             "interval_mode": "testing" if TESTING_MODE else "produksi",
@@ -652,8 +820,8 @@ def hasil_warna():
     data = baca_hasil()
     if data.get("timestamp"):
         try:
-            ts            = datetime.fromisoformat(data["timestamp"])
-            selisih       = (datetime.now() - ts).total_seconds()
+            ts             = datetime.fromisoformat(data["timestamp"])
+            selisih        = (datetime.now() - ts).total_seconds()
             data["menit_lalu"] = int(selisih / 60)
         except Exception:
             data["menit_lalu"] = None
@@ -663,11 +831,14 @@ def hasil_warna():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
-        "status"        : "ok",
-        "timestamp"     : datetime.now().isoformat(),
-        "testing_mode"  : TESTING_MODE,
-        "interval_detik": INTERVAL_POMPA_DETIK,
+        "status"                  : "ok",
+        "timestamp"               : datetime.now().isoformat(),
+        "testing_mode"            : TESTING_MODE,
+        "interval_terjadwal_detik": INTERVAL_TERJADWAL_DETIK,
+        "delay_darurat_detik"     : DELAY_DARURAT_DETIK,
+        "q_ml_per_menit"          : Q_ML_PER_MENIT,
     })
+
 
 # =============================================
 # MAIN — Flask + Bot Telegram
@@ -688,14 +859,18 @@ def run_bot():
         print("[BOT] bot_telegram.py berhenti! Restart dalam 30 detik...")
         time.sleep(30)
 
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     print("=" * 50)
-    print("Warna Endpoint REVISED — Mikroalga Spirulina")
+    print("Warna Endpoint — Mikroalga Spirulina")
     print("=" * 50)
-    print(f"[FLASK] Port  : {port}")
-    print(f"[MODE]  {'TESTING (3 menit)' if TESTING_MODE else 'PRODUKSI (3 hari)'}")
-    print(f"[pH]    Normal: {PH_NORMAL_MIN} – {PH_NORMAL_MAX}")
+    print(f"[FLASK] Port               : {port}")
+    print(f"[MODE]  {'TESTING' if TESTING_MODE else 'PRODUKSI'}")
+    print(f"[pH]    Normal             : {PH_NORMAL_MIN} – {PH_NORMAL_MAX}")
+    print(f"[POMPA] Interval terjadwal : {INTERVAL_TERJADWAL_DETIK // 3600} jam")
+    print(f"[POMPA] Delay darurat      : {DELAY_DARURAT_DETIK // 3600} jam")
+    print(f"[POMPA] Flow rate          : {Q_ML_PER_MENIT} mL/menit")
 
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
