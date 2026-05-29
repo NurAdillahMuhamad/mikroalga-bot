@@ -31,8 +31,8 @@ app = Flask(__name__)
 # =============================================
 # KONFIGURASI POMPA NUTRISI
 # =============================================
-TESTING_MODE         = True
-INTERVAL_POMPA_DETIK = 3 * 60          # 3 menit (testing)
+TESTING_MODE         = False
+INTERVAL_POMPA_DETIK = 3 * 24 * 3600          
 # INTERVAL_POMPA_DETIK = 3 * 24 * 3600 # 3 hari (produksi)
 
 V_MEDIA_LITER = 45.0
