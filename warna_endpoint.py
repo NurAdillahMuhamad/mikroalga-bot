@@ -527,7 +527,7 @@ def _get_atau_buat_folder(service, nama_folder, parent_id):
     folder = service.files().create(body=metadata, fields="id").execute()
     return folder["id"]
 
-def upload_ke_gdrive(jpeg_bytes: bytes, device_id: str, timestamp: str):
+def upload_ke_gdrive(jpeg_bytes: bytes, device_id: str, timestamp: str, fase: str, status_warna: str, skor: float):
     try:
         from googleapiclient.http import MediaIoBaseUpload
         service = _get_gdrive_service()
@@ -535,18 +535,48 @@ def upload_ke_gdrive(jpeg_bytes: bytes, device_id: str, timestamp: str):
             ts = datetime.fromisoformat(timestamp)
         except Exception:
             ts = datetime.now()
+        
         nama_folder = ts.strftime("%d-%m-%Y")
         nama_file   = ts.strftime("%H%M%S") + f"_{device_id}.jpg"
+        
         with _gdrive_lock:
             if nama_folder not in _gdrive_folder_cache:
                 folder_id = _get_atau_buat_folder(service, nama_folder, GDRIVE_PARENT_FOLDER_ID)
                 _gdrive_folder_cache[nama_folder] = folder_id
             else:
                 folder_id = _gdrive_folder_cache[nama_folder]
+        
         metadata = {"name": nama_file, "parents": [folder_id]}
         media    = MediaIoBaseUpload(io.BytesIO(jpeg_bytes), mimetype="image/jpeg", resumable=False)
         uploaded = service.files().create(body=metadata, media_body=media, fields="id, name").execute()
-        print(f"[GDRIVE] Upload sukses: {nama_folder}/{nama_file} → {uploaded['id']}")
+        file_id  = uploaded['id']
+        
+        # ★ TAMBAHAN: Simpan metadata ke foto_metadata table
+        try:
+            db = get_db()
+            with db.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO foto_metadata 
+                    (file_id, file_name, tanggal, jam, fase, status_warna, skor, kolam_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        file_id,
+                        nama_file,
+                        ts.date(),
+                        ts.time(),
+                        fase,
+                        status_warna,
+                        round(skor, 3),
+                        1  # kolam_id
+                    )
+                )
+            db.commit()
+            db.close()
+            print(f"[METADATA] Saved to foto_metadata: {file_id}")
+        except Exception as e:
+            print(f"[METADATA ERROR] {e}")
+        
+        print(f"[GDRIVE] Upload sukses: {nama_folder}/{nama_file} → {file_id}")
     except Exception as e:
         print(f"[GDRIVE ERROR] {e}")
 
@@ -768,9 +798,9 @@ def upload_foto():
 
         # Upload foto ke Google Drive (background thread)
         threading.Thread(
-            target=upload_ke_gdrive,
-            args=(jpeg_bytes, device_id, timestamp_now),
-            daemon=True,
+          target=upload_ke_gdrive,
+          args=(jpeg_bytes, device_id, timestamp_now, label, status, skor),
+          daemon=True,
         ).start()
 
         return jsonify({
