@@ -1,14 +1,9 @@
 """
-warna_endpoint.py
-=================
+warna_endpoint.py — UPDATED
 Perubahan dari versi sebelumnya:
-1. Logika pompa nutrisi dipisah jadi 2:
-   - Logika 1 (Darurat): pH abnormal DAN fase mundur → pompa nyala, delay 3 jam, cek lagi
-   - Logika 2 (Terjadwal): 3 hari stabil → pompa nyala, reset timer
-2. Fix rumus volume: hapus ×1000 (satuan langsung mL)
-3. Durasi pompa dihitung dari volume (bukan waktu tetap)
-4. Semua timestamp disimpan di DB agar tahan Railway restart
-5. Timer 3 hari direset jika kondisi darurat muncul di tengah periode
+1. Timezone WIB (UTC+7) di semua timestamp
+2. INSERT metadata foto ke tabel foto_metadata setelah upload ke Drive
+3. Simpan gdrive_file_id, gdrive_url, folder_name, file_name, warna, skor
 """
 
 import os
@@ -22,28 +17,36 @@ import cv2
 import pymysql
 import pymysql.cursors
 from flask import Flask, request, jsonify
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
+
+# =============================================
+# TIMEZONE WIB
+# =============================================
+WIB = timezone(timedelta(hours=7))
+
+def now_wib():
+    """Ambil waktu sekarang dalam WIB."""
+    return datetime.now(WIB).replace(tzinfo=None)
+
+def now_wib_iso():
+    """ISO string WIB untuk JSON response."""
+    return now_wib().isoformat()
 
 # =============================================
 # KONFIGURASI
 # =============================================
 TESTING_MODE = False
 
-# Logika 2: interval terjadwal
 INTERVAL_TERJADWAL_DETIK = 3 * 24 * 3600   # 3 hari produksi
 # INTERVAL_TERJADWAL_DETIK = 3 * 60         # 3 menit testing
 
-# Logika 1: delay antar cek saat kondisi darurat
 DELAY_DARURAT_DETIK = 3 * 3600              # 3 jam produksi
 # DELAY_DARURAT_DETIK = 3 * 60             # 3 menit testing
 
-# Durasi pompa dihitung dari volume
-# Pompa mengalirkan 100 mL per menit
 Q_ML_PER_MENIT = 100.0
-
-V_MEDIA_LITER = 45.0
+V_MEDIA_LITER  = 45.0
 
 KONSTANTA_NUTRISI = {
     "Fase 1: Pembibitan" : 0.2,
@@ -97,7 +100,6 @@ def get_ph_terbaru():
         return None
 
 def get_fase_db_terakhir():
-    """Ambil fase warna terakhir yang terdeteksi dari DB."""
     try:
         db = get_db()
         with db.cursor() as cur:
@@ -116,7 +118,6 @@ def get_fase_db_terakhir():
         return None
 
 def get_id_sensor_terakhir():
-    """Ambil id row terakhir dari mikroalga_sensor."""
     try:
         db = get_db()
         with db.cursor() as cur:
@@ -129,11 +130,6 @@ def get_id_sensor_terakhir():
         return None
 
 def get_waktu_pompa_nutrisi_terakhir():
-    """
-    Ambil waktu terakhir pompa nutrisi nyala dari DB.
-    Dipakai untuk hitung interval 3 hari (Logika 2)
-    dan delay 3 jam (Logika 1).
-    """
     try:
         db = get_db()
         with db.cursor() as cur:
@@ -150,17 +146,9 @@ def get_waktu_pompa_nutrisi_terakhir():
         return None
 
 def cek_stabilitas_3_hari():
-    """
-    Logika 2 — cek apakah selama 3 hari terakhir:
-    1. pH selalu dalam rentang normal (8.5–10.5)
-    2. Fase tidak pernah mundur
-
-    Return: (stabil: bool, alasan: str)
-    """
     try:
         db = get_db()
         with db.cursor() as cur:
-            # Cek pH abnormal dalam 3 hari terakhir
             cur.execute(
                 """
                 SELECT COUNT(*) as total,
@@ -173,8 +161,6 @@ def cek_stabilitas_3_hari():
             )
             row_ph = cur.fetchone()
 
-            # Cek fase mundur dalam 3 hari terakhir
-            # fase_sebelumnya lebih tinggi dari warna sekarang = mundur
             cur.execute(
                 """
                 SELECT COUNT(*) as fase_mundur
@@ -189,17 +175,14 @@ def cek_stabilitas_3_hari():
                     FIELD(fase_sebelumnya, %s, %s, %s, %s)
                 )
                 """,
-                (
-                    *URUTAN_FASE,   # untuk warna
-                    *URUTAN_FASE,   # untuk fase_sebelumnya
-                )
+                (*URUTAN_FASE, *URUTAN_FASE,)
             )
             row_fase = cur.fetchone()
         db.close()
 
-        total        = row_ph["total"] if row_ph else 0
-        ph_abnormal  = row_ph["ph_abnormal"] if row_ph else 0
-        fase_mundur  = row_fase["fase_mundur"] if row_fase else 0
+        total       = row_ph["total"]       if row_ph  else 0
+        ph_abnormal = row_ph["ph_abnormal"] if row_ph  else 0
+        fase_mundur = row_fase["fase_mundur"] if row_fase else 0
 
         if total == 0:
             return False, "belum ada data 3 hari"
@@ -209,7 +192,6 @@ def cek_stabilitas_3_hari():
             return False, f"fase mundur {fase_mundur}x dalam 3 hari"
 
         return True, "kondisi stabil 3 hari"
-
     except Exception as e:
         print(f"[DB] Gagal cek stabilitas: {e}")
         return False, f"db error: {e}"
@@ -218,19 +200,10 @@ def cek_stabilitas_3_hari():
 # LOGIKA POMPA NUTRISI
 # =============================================
 def hitung_volume_nutrisi(fase_label):
-    """
-    FIX: hapus ×1000, satuan langsung mL.
-    Contoh Fase 1: 0.2 × 45 = 9 mL
-    """
     k = KONSTANTA_NUTRISI.get(fase_label, 0.0)
     return round(k * V_MEDIA_LITER, 2)
 
 def hitung_durasi_detik(volume_ml):
-    """
-    Hitung durasi pompa dari volume.
-    Pompa = 100 mL/menit.
-    Contoh: 9 mL / 100 mL/menit × 60 detik = 5.4 detik
-    """
     return round((volume_ml / Q_ML_PER_MENIT) * 60, 1)
 
 def cek_fase_mundur(fase_sekarang, fase_sebelumnya):
@@ -241,24 +214,6 @@ def cek_fase_mundur(fase_sekarang, fase_sebelumnya):
     return URUTAN_FASE.index(fase_sekarang) < URUTAN_FASE.index(fase_sebelumnya)
 
 def cek_pompa_nutrisi(fase_sekarang, fase_sebelumnya_val):
-    """
-    Dua logika pemberian nutrisi:
-
-    LOGIKA 1 — DARURAT:
-    Syarat: pH abnormal DAN fase mundur (keduanya harus terpenuhi)
-    Setelah pompa nyala → delay 3 jam → cek lagi
-    Jika masih darurat → pompa nyala lagi
-    Jika sudah stabil → masuk Logika 2, reset timer 3 hari
-
-    LOGIKA 2 — TERJADWAL:
-    Syarat: sudah 3 hari sejak pemberian terakhir
-            DAN selama 3 hari pH selalu normal
-            DAN fase tidak pernah mundur
-    Jika di tengah periode Logika 2 kondisi darurat muncul
-    → langsung masuk Logika 1, timer 3 hari direset
-
-    Return: (pompa_on: bool, alasan: str, volume_ml: float, durasi_detik: float)
-    """
     if not fase_sekarang or fase_sekarang == "tidak terdeteksi":
         return False, "fase tidak terdeteksi", 0.0, 0.0
 
@@ -267,45 +222,31 @@ def cek_pompa_nutrisi(fase_sekarang, fase_sebelumnya_val):
     ph         = get_ph_terbaru()
     fase_mundur = cek_fase_mundur(fase_sekarang, fase_sebelumnya_val)
 
-    # Cek kondisi darurat (keduanya harus tidak normal)
     ph_abnormal = False
     if ph is not None:
         ph_abnormal = (ph < PH_NORMAL_MIN or ph > PH_NORMAL_MAX)
 
     kondisi_darurat = ph_abnormal and fase_mundur
 
-    # Ambil waktu terakhir pompa nyala dari DB
     waktu_terakhir = get_waktu_pompa_nutrisi_terakhir()
-    now            = datetime.now()
+    now = now_wib()
 
     if kondisi_darurat:
-        # ── LOGIKA 1: DARURAT ────────────────────────────────────
-        # Cek apakah delay 3 jam sudah lewat sejak darurat terakhir
         if waktu_terakhir is None:
-            # Belum pernah nyala → langsung nyala
             alasan = f"DARURAT: pH={ph} + fase mundur ({fase_sebelumnya_val}→{fase_sekarang})"
-            print(f"[POMPA] {alasan}")
             return True, alasan, volume, durasi
 
         selisih = (now - waktu_terakhir).total_seconds()
         if selisih >= DELAY_DARURAT_DETIK:
-            # Delay 3 jam sudah lewat → pompa nyala lagi
             alasan = (
                 f"DARURAT: pH={ph} + fase mundur ({fase_sebelumnya_val}→{fase_sekarang}) "
                 f"| {int(selisih/3600)} jam sejak terakhir"
             )
-            print(f"[POMPA] {alasan}")
             return True, alasan, volume, durasi
         else:
-            # Masih dalam delay 3 jam
             sisa = int((DELAY_DARURAT_DETIK - selisih) / 60)
-            alasan = f"DARURAT menunggu: sisa {sisa} menit delay 3 jam"
-            print(f"[POMPA] {alasan}")
-            return False, alasan, 0.0, 0.0
-
+            return False, f"DARURAT menunggu: sisa {sisa} menit delay 3 jam", 0.0, 0.0
     else:
-        # ── LOGIKA 2: TERJADWAL ──────────────────────────────────
-        # Syarat 1: sudah 3 hari sejak pemberian terakhir
         if waktu_terakhir is None:
             sudah_3_hari = True
         else:
@@ -316,42 +257,30 @@ def cek_pompa_nutrisi(fase_sekarang, fase_sebelumnya_val):
             sisa_jam = int((INTERVAL_TERJADWAL_DETIK - selisih) / 3600)
             return False, f"terjadwal: sisa {sisa_jam} jam", 0.0, 0.0
 
-        # Syarat 2: cek stabilitas 3 hari via query DB
         stabil, alasan_stabil = cek_stabilitas_3_hari()
         if not stabil:
             return False, f"terjadwal: {alasan_stabil}", 0.0, 0.0
 
         alasan = f"TERJADWAL 3 hari | {alasan_stabil}"
-        print(f"[POMPA] {alasan}")
         return True, alasan, volume, durasi
 
 def update_status_pompa_db(pompa_on: bool, volume_ml: float = 0.0, durasi_detik: float = 0.0):
-    """Update tabel status_pompa untuk pompa_nutrisi."""
     try:
         db  = get_db()
         val = "ON" if pompa_on else "OFF"
         with db.cursor() as cur:
-            # Cek apakah kolom vol_nutrisi ada di status_pompa
-            # Jika belum ada, update tanpa kolom itu
             try:
                 cur.execute(
-                    """
-                    UPDATE status_pompa
-                    SET pompa_nutrisi = %s,
-                        vol_nutrisi   = %s
-                    WHERE id = 1
-                    """,
+                    "UPDATE status_pompa SET pompa_nutrisi=%s, vol_nutrisi=%s WHERE id=1",
                     (val, volume_ml)
                 )
             except Exception:
-                # Fallback jika kolom vol_nutrisi belum ada
                 cur.execute(
-                    "UPDATE status_pompa SET pompa_nutrisi = %s WHERE id = 1",
-                    (val,)
+                    "UPDATE status_pompa SET pompa_nutrisi=%s WHERE id=1", (val,)
                 )
         db.commit()
         db.close()
-        print(f"[POMPA] status_pompa.pompa_nutrisi = {val} | vol = {volume_ml} mL | durasi = {durasi_detik}s")
+        print(f"[POMPA] status_pompa.pompa_nutrisi={val} | vol={volume_ml}mL | durasi={durasi_detik}s")
     except Exception as e:
         print(f"[DB] Gagal update status_pompa: {e}")
 
@@ -359,81 +288,76 @@ def update_status_pompa_db(pompa_on: bool, volume_ml: float = 0.0, durasi_detik:
 # UPDATE SENSOR DB
 # =============================================
 def update_sensor_db(label, status, skor, fase_sebelumnya_val):
-    """
-    UPDATE row terakhir di mikroalga_sensor dengan:
-    - warna, status_warna (hasil deteksi)
-    - pompa_nutrisi, vol_nutrisi (hasil keputusan pompa)
-    - fase_sebelumnya
-    - durasi_nutrisi_detik (berapa lama pompa harus nyala)
-    """
     try:
         pompa_on, alasan, volume_ml, durasi_detik = cek_pompa_nutrisi(label, fase_sebelumnya_val)
         update_status_pompa_db(pompa_on, volume_ml, durasi_detik)
 
         pompa_nutrisi_val = "ON" if pompa_on else "OFF"
-
         max_id = get_id_sensor_terakhir()
         if not max_id:
-            print("[DB] Tidak ada row untuk di-UPDATE, skip.")
             return False, "tidak ada row", 0.0, 0.0
 
         db = get_db()
         with db.cursor() as cur:
-            # Update row terakhir dengan semua data lengkap
             try:
                 cur.execute(
-                    """
-                    UPDATE mikroalga_sensor
-                    SET
-                        warna                = %s,
-                        status_warna         = %s,
-                        pompa_nutrisi        = %s,
-                        vol_nutrisi          = %s,
-                        durasi_nutrisi_detik = %s,
-                        fase_sebelumnya      = %s
-                    WHERE id = %s
-                    """,
-                    (
-                        label,
-                        status,
-                        pompa_nutrisi_val,
-                        volume_ml,
-                        durasi_detik,
-                        fase_sebelumnya_val,
-                        max_id,
-                    )
+                    """UPDATE mikroalga_sensor
+                    SET warna=%s, status_warna=%s, pompa_nutrisi=%s,
+                        vol_nutrisi=%s, durasi_nutrisi_detik=%s, fase_sebelumnya=%s
+                    WHERE id=%s""",
+                    (label, status, pompa_nutrisi_val, volume_ml, durasi_detik, fase_sebelumnya_val, max_id)
                 )
             except Exception:
-                # Fallback jika kolom durasi_nutrisi_detik belum ada
                 cur.execute(
-                    """
-                    UPDATE mikroalga_sensor
-                    SET
-                        warna           = %s,
-                        status_warna    = %s,
-                        pompa_nutrisi   = %s,
-                        vol_nutrisi     = %s,
-                        fase_sebelumnya = %s
-                    WHERE id = %s
-                    """,
-                    (
-                        label,
-                        status,
-                        pompa_nutrisi_val,
-                        volume_ml,
-                        fase_sebelumnya_val,
-                        max_id,
-                    )
+                    """UPDATE mikroalga_sensor
+                    SET warna=%s, status_warna=%s, pompa_nutrisi=%s,
+                        vol_nutrisi=%s, fase_sebelumnya=%s
+                    WHERE id=%s""",
+                    (label, status, pompa_nutrisi_val, volume_ml, fase_sebelumnya_val, max_id)
                 )
         db.commit()
         db.close()
-
-        print(f"[DB] UPDATE id={max_id} | warna={label} | pompa_nutrisi={pompa_nutrisi_val} | vol={volume_ml}mL | durasi={durasi_detik}s | alasan={alasan}")
+        print(f"[DB] UPDATE id={max_id} | warna={label} | pompa_nutrisi={pompa_nutrisi_val} | vol={volume_ml}mL | alasan={alasan}")
         return pompa_on, alasan, volume_ml, durasi_detik
 
     except Exception as e:
         print(f"[DB] Gagal UPDATE sensor: {e}")
         return False, "db error", 0.0, 0.0
+
+# =============================================
+# INSERT METADATA FOTO KE DB (NEW)
+# =============================================
+def insert_foto_metadata(device_id: str, gdrive_file_id: str, gdrive_url: str,
+                          folder_name: str, file_name: str,
+                          warna: str, status_warna: str, skor: float,
+                          kolam: int = 1):
+    """
+    INSERT satu baris ke tabel foto_metadata.
+    Dipanggil setelah upload Google Drive berhasil.
+    Timestamp menggunakan WIB (UTC+7).
+    """
+    try:
+        db = get_db()
+        waktu_wib = now_wib().strftime("%Y-%m-%d %H:%M:%S")
+        with db.cursor() as cur:
+            cur.execute(
+                """INSERT INTO foto_metadata
+                   (device_id, kolam, gdrive_file_id, gdrive_url,
+                    folder_name, file_name, warna, status_warna, skor, waktu)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (device_id, kolam,
+                 gdrive_file_id or "", gdrive_url or "",
+                 folder_name or "", file_name or "",
+                 warna or "tidak terdeteksi",
+                 status_warna or "-",
+                 round(float(skor), 3),
+                 waktu_wib)
+            )
+        db.commit()
+        db.close()
+        print(f"[FOTO_META] INSERT OK — {folder_name}/{file_name} | warna={warna} | id={gdrive_file_id}")
+    except Exception as e:
+        print(f"[FOTO_META] Gagal INSERT metadata: {e}")
 
 # =============================================
 # STATE GLOBAL
@@ -453,30 +377,10 @@ _hasil_warna = {
 # PROFIL HSV FALLBACK
 # =============================================
 PROFIL_FALLBACK = {
-    "fase1": {
-        "label" : "Fase 1: Pembibitan",
-        "lower" : [25, 30, 80],
-        "upper" : [45, 120, 200],
-        "hist_h": [], "hist_s": [],
-    },
-    "fase2": {
-        "label" : "Fase 2: Pertumbuhan",
-        "lower" : [40, 60, 60],
-        "upper" : [75, 180, 180],
-        "hist_h": [], "hist_s": [],
-    },
-    "fase3": {
-        "label" : "Fase 3: Optimal",
-        "lower" : [75, 80, 40],
-        "upper" : [100, 220, 160],
-        "hist_h": [], "hist_s": [],
-    },
-    "fase4": {
-        "label" : "Fase 4: Panen",
-        "lower" : [90, 100, 20],
-        "upper" : [120, 255, 100],
-        "hist_h": [], "hist_s": [],
-    },
+    "fase1": {"label":"Fase 1: Pembibitan",  "lower":[25,30,80],  "upper":[45,120,200], "hist_h":[], "hist_s":[]},
+    "fase2": {"label":"Fase 2: Pertumbuhan", "lower":[40,60,60],  "upper":[75,180,180], "hist_h":[], "hist_s":[]},
+    "fase3": {"label":"Fase 3: Optimal",     "lower":[75,80,40],  "upper":[100,220,160],"hist_h":[], "hist_s":[]},
+    "fase4": {"label":"Fase 4: Panen",       "lower":[90,100,20], "upper":[120,255,100],"hist_h":[], "hist_s":[]},
 }
 
 BOBOT_HSV  = 0.55
@@ -527,58 +431,66 @@ def _get_atau_buat_folder(service, nama_folder, parent_id):
     folder = service.files().create(body=metadata, fields="id").execute()
     return folder["id"]
 
-def upload_ke_gdrive(jpeg_bytes: bytes, device_id: str, timestamp: str, fase: str, status_warna: str, skor: float):
+def upload_ke_gdrive(jpeg_bytes: bytes, device_id: str, timestamp: str,
+                     warna: str = "tidak terdeteksi",
+                     status_warna: str = "-",
+                     skor: float = 0.0,
+                     kolam: int = 1):
+    """
+    Upload foto ke Google Drive + INSERT metadata ke DB.
+    Fungsi ini dijalankan di background thread.
+    Timestamp folder menggunakan WIB.
+    """
+    gdrive_file_id = ""
+    gdrive_url     = ""
+    folder_name    = ""
+    file_name      = ""
+
     try:
         from googleapiclient.http import MediaIoBaseUpload
         service = _get_gdrive_service()
+
+        # Konversi timestamp ke WIB untuk nama folder/file
         try:
             ts = datetime.fromisoformat(timestamp)
         except Exception:
-            ts = datetime.now()
-        
-        nama_folder = ts.strftime("%d-%m-%Y")
-        nama_file   = ts.strftime("%H%M%S") + f"_{device_id}.jpg"
-        
+            ts = now_wib()
+        # Pastikan nama folder pakai tanggal WIB
+        folder_name = ts.strftime("%d-%m-%Y")
+        file_name   = ts.strftime("%H%M%S") + f"_{device_id}.jpg"
+
         with _gdrive_lock:
-            if nama_folder not in _gdrive_folder_cache:
-                folder_id = _get_atau_buat_folder(service, nama_folder, GDRIVE_PARENT_FOLDER_ID)
-                _gdrive_folder_cache[nama_folder] = folder_id
+            if folder_name not in _gdrive_folder_cache:
+                folder_id = _get_atau_buat_folder(service, folder_name, GDRIVE_PARENT_FOLDER_ID)
+                _gdrive_folder_cache[folder_name] = folder_id
             else:
-                folder_id = _gdrive_folder_cache[nama_folder]
-        
-        metadata = {"name": nama_file, "parents": [folder_id]}
+                folder_id = _gdrive_folder_cache[folder_name]
+
+        metadata = {"name": file_name, "parents": [folder_id]}
         media    = MediaIoBaseUpload(io.BytesIO(jpeg_bytes), mimetype="image/jpeg", resumable=False)
-        uploaded = service.files().create(body=metadata, media_body=media, fields="id, name").execute()
-        file_id  = uploaded['id']
-        
-        # ★ TAMBAHAN: Simpan metadata ke foto_metadata table
-        try:
-            db = get_db()
-            with db.cursor() as cur:
-                cur.execute(
-                    """INSERT INTO foto_metadata 
-                    (file_id, file_name, tanggal, jam, fase, status_warna, skor, kolam_id)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (
-                        file_id,
-                        nama_file,
-                        ts.date(),
-                        ts.time(),
-                        fase,
-                        status_warna,
-                        round(skor, 3),
-                        1  # kolam_id
-                    )
-                )
-            db.commit()
-            db.close()
-            print(f"[METADATA] Saved to foto_metadata: {file_id}")
-        except Exception as e:
-            print(f"[METADATA ERROR] {e}")
-        
-        print(f"[GDRIVE] Upload sukses: {nama_folder}/{nama_file} → {file_id}")
+        uploaded = service.files().create(
+            body=metadata, media_body=media, fields="id, name, webViewLink"
+        ).execute()
+
+        gdrive_file_id = uploaded.get("id", "")
+        gdrive_url     = uploaded.get("webViewLink", "")
+        print(f"[GDRIVE] Upload sukses: {folder_name}/{file_name} → {gdrive_file_id}")
+
     except Exception as e:
         print(f"[GDRIVE ERROR] {e}")
+
+    # INSERT metadata ke DB (bahkan jika upload gagal, tetap catat dengan ID kosong)
+    insert_foto_metadata(
+        device_id      = device_id,
+        gdrive_file_id = gdrive_file_id,
+        gdrive_url     = gdrive_url,
+        folder_name    = folder_name,
+        file_name      = file_name,
+        warna          = warna,
+        status_warna   = status_warna,
+        skor           = skor,
+        kolam          = kolam,
+    )
 
 # =============================================
 # LOAD PROFIL HSV
@@ -678,12 +590,8 @@ def deteksi_warna(jpeg_bytes: bytes):
     hasil     = []
     for fase_key, profil in profil_data.items():
         s_hsv  = skor_hsv(hsv, mask_kaca, profil["lower"], profil["upper"])
-        s_hist = skor_histogram(
-            hsv, mask_kaca,
-            profil.get("hist_h", []),
-            profil.get("hist_s", [])
-        )
-        skor = BOBOT_HSV * s_hsv + BOBOT_HIST * s_hist
+        s_hist = skor_histogram(hsv, mask_kaca, profil.get("hist_h", []), profil.get("hist_s", []))
+        skor   = BOBOT_HSV * s_hsv + BOBOT_HIST * s_hist
         hasil.append((skor, profil["label"], fase_key))
     hasil.sort(reverse=True)
     if hasil and hasil[0][0] >= SKOR_MIN:
@@ -713,7 +621,6 @@ def simpan_hasil(data: dict):
         print(f"[JSON] Gagal simpan hasil_warna.json: {e}")
 
 def baca_hasil() -> dict:
-    """Baca hasil deteksi, fallback ke DB jika file tidak ada."""
     if os.path.exists(HASIL_PATH):
         try:
             with open(HASIL_PATH, "r") as f:
@@ -751,7 +658,8 @@ def baca_hasil() -> dict:
 @app.route("/upload_foto", methods=["POST"])
 def upload_foto():
     try:
-        device_id = request.form.get("device_id", "unknown")
+        device_id  = request.form.get("device_id", "unknown")
+        kolam      = int(request.form.get("kolam", 1))
 
         if "foto" not in request.files:
             return jsonify({"ok": False, "error": "Tidak ada field 'foto'"}), 400
@@ -762,20 +670,18 @@ def upload_foto():
 
         print(f"[UPLOAD] {device_id} — {len(jpeg_bytes)} bytes")
 
-        # Ambil fase DB terakhir SEBELUM deteksi → fase_sebelumnya
         fase_sebelumnya_val = get_fase_db_terakhir()
-
-        # Deteksi warna + bbox
         label, status, skor, bbox = deteksi_warna(jpeg_bytes)
 
-        timestamp_now = datetime.now().isoformat()
+        # Timestamp WIB
+        timestamp_wib = now_wib_iso()
 
         hasil = {
             "warna"       : label,
             "status_warna": status,
             "skor"        : skor,
             "device_id"   : device_id,
-            "timestamp"   : timestamp_now,
+            "timestamp"   : timestamp_wib,
             "bbox"        : bbox,
         }
 
@@ -785,22 +691,27 @@ def upload_foto():
 
         print(f"[DETEKSI] {label} | {status} | skor={skor} | fase_sebelumnya={fase_sebelumnya_val}")
 
-        # UPDATE row terakhir di DB
         pompa_on, alasan, volume_ml, durasi_detik = update_sensor_db(
             label, status, skor, fase_sebelumnya_val
         )
 
-        hasil["pompa_nutrisi"]  = "ON" if pompa_on else "OFF"
-        hasil["pompa_alasan"]   = alasan
-        hasil["volume_ml"]      = volume_ml
-        hasil["durasi_detik"]   = durasi_detik
+        hasil["pompa_nutrisi"] = "ON" if pompa_on else "OFF"
+        hasil["pompa_alasan"]  = alasan
+        hasil["volume_ml"]     = volume_ml
+        hasil["durasi_detik"]  = durasi_detik
         simpan_hasil(hasil)
 
-        # Upload foto ke Google Drive (background thread)
+        # Upload ke Google Drive + INSERT metadata (background thread)
         threading.Thread(
-          target=upload_ke_gdrive,
-          args=(jpeg_bytes, device_id, timestamp_now, label, status, skor),
-          daemon=True,
+            target=upload_ke_gdrive,
+            args=(jpeg_bytes, device_id, timestamp_wib),
+            kwargs={
+                "warna"       : label,
+                "status_warna": status,
+                "skor"        : skor,
+                "kolam"       : kolam,
+            },
+            daemon=True,
         ).start()
 
         return jsonify({
@@ -813,6 +724,7 @@ def upload_foto():
             "volume_ml"    : volume_ml,
             "durasi_detik" : durasi_detik,
             "alasan"       : alasan,
+            "timestamp"    : timestamp_wib,
         })
 
     except Exception as e:
@@ -822,15 +734,10 @@ def upload_foto():
 
 @app.route("/status_pompa_nutrisi", methods=["GET"])
 def status_pompa_nutrisi():
-    """
-    Endpoint yang dipoll ESP32 setiap 30 detik.
-    Mengembalikan status pompa nutrisi beserta volume dan durasi.
-    ESP32 pakai durasi_detik untuk hitung berapa lama relay nyala.
-    """
     try:
-        data       = baca_hasil()
-        fase       = data.get("warna", "tidak terdeteksi")
-        fase_sblm  = get_fase_db_terakhir()
+        data      = baca_hasil()
+        fase      = data.get("warna", "tidak terdeteksi")
+        fase_sblm = get_fase_db_terakhir()
         pompa_on, alasan, volume_ml, durasi_detik = cek_pompa_nutrisi(fase, fase_sblm)
         return jsonify({
             "pompa_nutrisi": "ON" if pompa_on else "OFF",
@@ -851,7 +758,7 @@ def hasil_warna():
     if data.get("timestamp"):
         try:
             ts             = datetime.fromisoformat(data["timestamp"])
-            selisih        = (datetime.now() - ts).total_seconds()
+            selisih        = (now_wib() - ts).total_seconds()
             data["menit_lalu"] = int(selisih / 60)
         except Exception:
             data["menit_lalu"] = None
@@ -862,7 +769,7 @@ def hasil_warna():
 def health():
     return jsonify({
         "status"                  : "ok",
-        "timestamp"               : datetime.now().isoformat(),
+        "timestamp_wib"           : now_wib_iso(),
         "testing_mode"            : TESTING_MODE,
         "interval_terjadwal_detik": INTERVAL_TERJADWAL_DETIK,
         "delay_darurat_detik"     : DELAY_DARURAT_DETIK,
@@ -893,10 +800,11 @@ def run_bot():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     print("=" * 50)
-    print("Warna Endpoint — Mikroalga Spirulina")
+    print("Warna Endpoint — Mikroalga Spirulina (WIB)")
     print("=" * 50)
     print(f"[FLASK] Port               : {port}")
     print(f"[MODE]  {'TESTING' if TESTING_MODE else 'PRODUKSI'}")
+    print(f"[WIB]   Waktu sekarang     : {now_wib_iso()}")
     print(f"[pH]    Normal             : {PH_NORMAL_MIN} – {PH_NORMAL_MAX}")
     print(f"[POMPA] Interval terjadwal : {INTERVAL_TERJADWAL_DETIK // 3600} jam")
     print(f"[POMPA] Delay darurat      : {DELAY_DARURAT_DETIK // 3600} jam")
