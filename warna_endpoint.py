@@ -436,51 +436,37 @@ def upload_ke_gdrive(jpeg_bytes: bytes, device_id: str, timestamp: str,
                      status_warna: str = "-",
                      skor: float = 0.0,
                      kolam: int = 1):
-    """
-    Upload foto ke Google Drive + INSERT metadata ke DB.
-    Fungsi ini dijalankan di background thread.
-    Timestamp folder menggunakan WIB.
-    """
     gdrive_file_id = ""
     gdrive_url     = ""
     folder_name    = ""
     file_name      = ""
-
     try:
         from googleapiclient.http import MediaIoBaseUpload
         service = _get_gdrive_service()
-
-        # Konversi timestamp ke WIB untuk nama folder/file
         try:
             ts = datetime.fromisoformat(timestamp)
         except Exception:
             ts = now_wib()
-        # Pastikan nama folder pakai tanggal WIB
         folder_name = ts.strftime("%d-%m-%Y")
         file_name   = ts.strftime("%H%M%S") + f"_{device_id}.jpg"
-
         with _gdrive_lock:
             if folder_name not in _gdrive_folder_cache:
                 folder_id = _get_atau_buat_folder(service, folder_name, GDRIVE_PARENT_FOLDER_ID)
                 _gdrive_folder_cache[folder_name] = folder_id
             else:
                 folder_id = _gdrive_folder_cache[folder_name]
-
         metadata = {"name": file_name, "parents": [folder_id]}
         media    = MediaIoBaseUpload(io.BytesIO(jpeg_bytes), mimetype="image/jpeg", resumable=False)
         uploaded = service.files().create(
             body=metadata, media_body=media, fields="id, name, webViewLink"
         ).execute()
-
         gdrive_file_id = uploaded.get("id", "")
         gdrive_url     = uploaded.get("webViewLink", "")
         print(f"[GDRIVE] Upload sukses: {folder_name}/{file_name} → {gdrive_file_id}")
-
     except Exception as e:
         print(f"[GDRIVE ERROR] {e}")
 
-    # INSERT metadata ke DB (bahkan jika upload gagal, tetap catat dengan ID kosong)
-    insert_foto_metadata(
+    insert_foto_metadata(       # ← indent 4 spasi, di dalam fungsi
         device_id      = device_id,
         gdrive_file_id = gdrive_file_id,
         gdrive_url     = gdrive_url,
