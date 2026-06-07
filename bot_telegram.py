@@ -303,6 +303,11 @@ def analisis_ai(sensor_data: dict, img_base64: str = None) -> str:
         res = r.json()
         return res["choices"][0]["message"]["content"].strip()
     except Exception as e:
+        try:
+            print(f"[GROQ STATUS] {r.status_code}")
+            print(f"[GROQ RAW] {r.text}")
+        except:
+            pass
         return f"_(Analisis AI tidak tersedia: {e})_"
 
 
