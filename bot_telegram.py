@@ -292,7 +292,7 @@ def analisis_ai(sensor_data: dict, img_base64: str = None) -> str:
             "Content-Type" : "application/json"
         }
         body = {
-            "model"     : "llama-3.1-8b-instant",
+            "model": "llama3-8b-8192",
             "messages"  : [{"role": "user", "content": prompt}],
             "max_tokens": 300
         }
@@ -533,7 +533,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Content-Type" : "application/json"
         }
         body = {
-            "model"     : "llama-3.1-8b-instant",  # ← ganti dari llama3-8b-8192
+            "model": "llama3-8b-8192",  # ← ganti dari llama3-8b-8192
             "messages"  : [{"role": "user", "content": prompt}],
             "max_tokens": 300
 }
