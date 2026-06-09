@@ -293,7 +293,27 @@ def analisis_ai(sensor_data: dict, img_base64: str = None) -> str:
         }
         body = {
             "model": "llama-3.3-70b-versatile",
-            "messages"  : [{"role": "user", "content": prompt}],
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Kamu adalah sistem monitoring otomatis kolam mikroalga Spirulina sp. "
+                        "Sistem memiliki parameter berikut:\n"
+                        "- pH normal: 8.5 hingga 10.5, target 9.0\n"
+                        "- Jika pH < 8.5: pompa basa aktif otomatis\n"
+                        "- Jika pH > 10.5: pompa asam aktif otomatis\n"
+                        "- Cahaya diukur sensor BH1750, jika < 1500 lux: lampu UV aktif\n"
+                        "- Fase pertumbuhan: Fase 1 Pembibitan, Fase 2 Pertumbuhan, "
+                        "Fase 3 Optimal, Fase 4 Panen\n"
+                        "- Jika status_warna = MUNDUR artinya fase turun, kondisi kritis\n"
+                        "- Pompa nutrisi aktif otomatis setiap 3 menit (mode testing)\n\n"
+                        "Berikan analisis kondisi kolam berdasarkan data sensor yang diberikan. "
+                        "Gunakan bahasa Indonesia formal dan singkat. "
+                        "Format: 2 kalimat analisis kondisi saat ini + 1 kalimat rekomendasi tindakan."
+                    )
+                },
+                {"role": "user", "content": prompt}
+            ],
             "max_tokens": 300
         }
         r   = requests.post(
