@@ -562,9 +562,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sensor = get_sensor_data()
         teks   = format_status(sensor)
         kb     = [[InlineKeyboardButton("🔄 Refresh", callback_data="status")]]
-        await q.edit_message_text(teks, parse_mode="Markdown",
-                                  reply_markup=InlineKeyboardMarkup(kb))
-
+        try:
+            await q.edit_message_text(teks, parse_mode="Markdown",
+                                      reply_markup=InlineKeyboardMarkup(kb))
+        except Exception:
+            pass
+            
     elif data == "foto":
         await q.edit_message_text("⏳ Mengambil foto...")
         try:
